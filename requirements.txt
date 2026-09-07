@@ -1,0 +1,17 @@
+# Claude API 클라이언트
+anthropic==1.4.0
+
+# DuckDuckGo 웹 검색 (구 duckduckgo-search 패키지의 후속 버전)
+ddgs==9.16.0
+
+# .env 파일 로딩
+python-dotenv==1.2.3
+
+# PostgreSQL 드라이버 (psycopg2 의 사전 빌드 배포판)
+psycopg2-binary==2.9.12
+
+# 로컬 한국어 임베딩 (jhgan/ko-sroberta-multitask, 768차원) - torch/transformers 를 의존성으로 포함
+sentence-transformers==6.0.1
+
+# 웹 프론트엔드
+streamlit==1.63.0
