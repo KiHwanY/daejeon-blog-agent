@@ -35,6 +35,7 @@ RESULT_KEYS = (
     "topic", "mode", "similar_posts", "final_content",
     "research", "sources", "outline", "draft", "post_id",
     "tone", "seo_keywords", "seo_report", "image_url",
+    "search_retried", "critique_passed", "critique_feedback", "was_rewritten",
 )
 
 TONE_OPTIONS = ["정보성", "캐주얼", "리뷰형", "전문적"]
@@ -105,6 +106,41 @@ def _card_image_url(post: dict) -> str:
     return f"https://picsum.photos/seed/{seed}/600/400"
 
 
+def _render_agent_log(src: dict) -> None:
+    """에이전트 자체 판단 로그를 접이식으로 표시한다 (검색 재시도 / 자체 검토 / 재작성)."""
+    has_any = any(
+        src.get(k) is not None
+        for k in ("search_retried", "critique_passed", "was_rewritten", "critique_feedback")
+    )
+    if not has_any:
+        return
+
+    retried = bool(src.get("search_retried"))
+    passed = src.get("critique_passed")
+    rewritten = bool(src.get("was_rewritten"))
+    feedback = src.get("critique_feedback") or ""
+
+    if passed is True and not rewritten:
+        summary = "✅ 자체 검토 통과"
+    elif rewritten:
+        summary = "🔁 자체 검토 후 재작성함"
+    elif passed is False:
+        summary = "⚠️ 자체 검토 미통과"
+    else:
+        summary = "자체 판단 로그"
+
+    with st.expander(f"🧠 에이전트 판단 로그 — {summary}"):
+        st.markdown(f"- **검색 재시도**: {'예 (결과 부족으로 새 키워드 재검색)' if retried else '아니오'}")
+        if passed is None:
+            st.markdown("- **자체 검토**: 기록 없음")
+        else:
+            st.markdown(f"- **자체 검토 결과**: {'통과(pass)' if passed else '미통과(fail)'}")
+        st.markdown(f"- **재작성 여부**: {'예 (피드백 반영해 1회 재작성)' if rewritten else '아니오'}")
+        if feedback:
+            st.markdown("- **검토 피드백**:")
+            st.info(feedback)
+
+
 def _render_post_cards(posts: list[dict]) -> None:
     """유사 글을 카드 그리드로 표시 (상단 70% 이미지 / 하단 30% 내용)."""
     if not posts:
@@ -142,6 +178,7 @@ def _render_post_cards(posts: list[dict]) -> None:
                         mime="text/markdown",
                         key=f"dl_{post.get('id')}",
                     )
+                _render_agent_log(post)
 
 
 def _render_seo_check() -> None:
@@ -209,6 +246,8 @@ _STAGE_LABELS = {
     "research": ("1/3 · 리서치 중 (웹 검색)...", "1/3 · 리서치 완료"),
     "outline": ("2/3 · 아웃라인 작성 중...", "2/3 · 아웃라인 완료"),
     "draft": ("3/3 · 블로그 초안 작성 중...", "3/3 · 초안 완료"),
+    "critique": ("자체 검토 중 (사실·구조·톤·SEO)...", "자체 검토 완료"),
+    "rewrite": ("재작성 중 (검토 피드백 반영)...", "재작성 완료"),
     "image": ("이미지 검색 중 (Pexels)...", "이미지 준비 완료"),
     "save": ("저장 중 (임베딩 생성 + DB 저장)...", "저장 완료"),
 }
@@ -233,6 +272,10 @@ def _run_pipeline(topic_text: str, tone: str, seo_raw: str) -> dict:
                 done_label = f"blog_posts #{ev['post_id']} 저장 완료"
             elif stage == "image" and not ev.get("image_url"):
                 done_label = "이미지 없음 (플레이스홀더 사용)"
+            elif stage == "critique":
+                done_label = (
+                    "자체 검토 통과" if ev.get("passed") else "자체 검토 미통과 → 재작성"
+                )
             widget.update(label=done_label, state="complete", expanded=False)
 
     def on_search(query: str) -> None:
@@ -258,7 +301,9 @@ def _stash_result(result: dict) -> None:
 
     st.session_state["mode"] = "new"
     for key in ("research", "sources", "outline", "draft",
-                "final_content", "post_id", "seo_report", "image_url"):
+                "final_content", "post_id", "seo_report", "image_url",
+                "search_retried", "critique_passed", "critique_feedback",
+                "was_rewritten"):
         st.session_state[key] = result[key]
 
 
@@ -319,6 +364,8 @@ elif mode == "new":
         "topic": topic_done,
     })
     st.image(hero, use_container_width=True)
+
+    _render_agent_log(st.session_state)
 
     st.subheader("1. 리서치 결과")
     st.markdown(st.session_state["research"])

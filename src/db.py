@@ -64,6 +64,11 @@ SCHEMA_STATEMENTS = [
     "ALTER TABLE blog_posts ADD COLUMN IF NOT EXISTS tone TEXT;",
     "ALTER TABLE blog_posts ADD COLUMN IF NOT EXISTS seo_keywords TEXT;",
     "ALTER TABLE blog_posts ADD COLUMN IF NOT EXISTS image_url TEXT;",
+    # 자체 품질 검토 / 재시도 메타데이터
+    "ALTER TABLE blog_posts ADD COLUMN IF NOT EXISTS critique_passed BOOLEAN;",
+    "ALTER TABLE blog_posts ADD COLUMN IF NOT EXISTS critique_feedback TEXT;",
+    "ALTER TABLE blog_posts ADD COLUMN IF NOT EXISTS was_rewritten BOOLEAN DEFAULT FALSE;",
+    "ALTER TABLE blog_posts ADD COLUMN IF NOT EXISTS search_retried BOOLEAN DEFAULT FALSE;",
     """
     CREATE TABLE IF NOT EXISTS search_cache (
         id           SERIAL PRIMARY KEY,
@@ -131,6 +136,7 @@ def find_similar_posts(
     """topic 과 유사한 글들을 유사도 내림차순으로 최대 limit 개 반환한다.
 
     각 항목: {id, topic, final_content, tone, seo_keywords, image_url,
+             critique_passed, critique_feedback, was_rewritten, search_retried,
              created_at, similarity}
     유사도가 threshold 미만인 글은 제외한다.
     """
@@ -142,7 +148,8 @@ def find_similar_posts(
             cur.execute(
                 """
                 SELECT id, topic, final_content, tone, seo_keywords, image_url,
-                       created_at,
+                       critique_passed, critique_feedback, was_rewritten,
+                       search_retried, created_at,
                        1 - (embedding <=> %(v)s::vector) AS similarity
                 FROM blog_posts
                 WHERE embedding IS NOT NULL
@@ -157,7 +164,7 @@ def find_similar_posts(
 
     posts = []
     for r in rows:
-        similarity = float(r[7])
+        similarity = float(r[11])
         if similarity < threshold:
             continue
         posts.append(
@@ -168,7 +175,11 @@ def find_similar_posts(
                 "tone": r[3],
                 "seo_keywords": r[4],
                 "image_url": r[5],
-                "created_at": r[6],
+                "critique_passed": r[6],
+                "critique_feedback": r[7],
+                "was_rewritten": r[8],
+                "search_retried": r[9],
+                "created_at": r[10],
                 "similarity": similarity,
             }
         )
@@ -184,6 +195,10 @@ def save_blog_post(
     tone=None,
     seo_keywords=None,
     image_url=None,
+    critique_passed=None,
+    critique_feedback=None,
+    was_rewritten=False,
+    search_retried=False,
 ) -> int:
     """완성된 글을 blog_posts 에 저장하고 새 id 를 반환한다."""
     vec_literal = _to_vector_literal(embedding) if embedding is not None else None
@@ -196,13 +211,17 @@ def save_blog_post(
                     """
                     INSERT INTO blog_posts
                         (topic, outline, draft, final_content,
-                         tone, seo_keywords, image_url, embedding)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s::vector)
+                         tone, seo_keywords, image_url,
+                         critique_passed, critique_feedback,
+                         was_rewritten, search_retried, embedding)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::vector)
                     RETURNING id;
                     """,
                     (
                         topic, outline, draft, final_content,
-                        tone, seo_keywords, image_url, vec_literal,
+                        tone, seo_keywords, image_url,
+                        critique_passed, critique_feedback,
+                        was_rewritten, search_retried, vec_literal,
                     ),
                 )
                 new_id = cur.fetchone()[0]

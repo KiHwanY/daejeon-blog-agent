@@ -4,6 +4,8 @@
 web_search 도구 정의 · DuckDuckGo 검색(+캐시) · 신뢰 소스 표시 · tool-use 루프.
 """
 
+import json
+import re
 from functools import lru_cache
 from urllib.parse import urlparse
 
@@ -12,6 +14,28 @@ from ddgs import DDGS
 from config import MODEL
 from db import find_cached_search, get_trusted_sources, save_search_cache
 from embeddings import embed_text
+
+
+def extract_json(text: str) -> dict | None:
+    """LLM 응답 텍스트에서 첫 JSON 오브젝트를 추출해 dict 로 반환한다. 실패 시 None.
+
+    ```json ... ``` 펜스나 앞뒤 설명이 섞여 있어도 최대한 뽑아낸다.
+    """
+    if not text:
+        return None
+    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    candidate = fenced.group(1) if fenced else None
+    if candidate is None:
+        brace = re.search(r"\{.*\}", text, re.DOTALL)
+        candidate = brace.group(0) if brace else None
+    if candidate is None:
+        return None
+    try:
+        value = json.loads(candidate)
+    except (ValueError, TypeError):
+        return None
+    return value if isinstance(value, dict) else None
+
 
 # 에이전트가 사용할 도구 정의(스키마)
 TOOLS = [
@@ -145,6 +169,37 @@ def last_text(response) -> str:
     return out
 
 
+# 결과가 부족할 때 재검색 키워드를 물어보는 지시문
+_RETRY_SYSTEM = (
+    "직전 웹 검색 결과가 부족했습니다. 사용자 요청과 이미 시도한 검색어를 보고 "
+    "(1) 결과가 부족했던 이유를 한 문장으로, "
+    "(2) 이전과 다른 각도의 더 나은 검색어(한국어, 3~6단어)를 제시하세요. "
+    'JSON 한 줄로만 답하세요: {"reason": "...", "keywords": "..."}'
+)
+
+
+def _suggest_retry_keywords(client, model, user_prompt, tried_queries) -> str | None:
+    """검색 결과가 부족했을 때 Claude 에게 새 검색어를 물어본다. 실패하면 None."""
+    ask = (
+        f"사용자 요청:\n{user_prompt}\n\n"
+        f"이미 시도한 검색어: {tried_queries or '(없음)'}\n"
+        "이와 겹치지 않는 새 검색어가 필요합니다."
+    )
+    try:
+        response = client.messages.create(
+            model=model,
+            max_tokens=200,
+            system=_RETRY_SYSTEM,
+            messages=[{"role": "user", "content": ask}],
+        )
+    except Exception:  # noqa: BLE001 - 재시도 제안 실패 시 그냥 재시도 안 함
+        return None
+
+    data = extract_json(last_text(response)) or {}
+    keywords = (data.get("keywords") or "").strip()
+    return keywords or None
+
+
 def run_search_loop(
     client,
     user_prompt: str,
@@ -155,16 +210,36 @@ def run_search_loop(
     query_transform=None,
     model: str = MODEL,
     max_tokens: int = 3000,
-) -> tuple[str, list[dict]]:
-    """tool_use 루프를 돌며 (최종 텍스트, 출처 리스트) 를 반환한다.
+    retry_on_thin: bool = False,
+    min_results: int = 2,
+) -> dict:
+    """tool_use 루프를 돌며 {"text", "sources", "search_retried"} 를 반환한다.
 
     on_search: 검색 실행 때마다 호출되는 콜백 (query: str) -> None
     query_transform: 모델이 만든 검색어를 실제 검색 전에 가공하는 함수 (str) -> str
+    retry_on_thin: True 이고 유효 검색 결과가 min_results 이하이면, Claude 에게
+        새 검색어를 물어 1회만 추가 검색한다(무한 재시도 방지).
     """
     messages = [{"role": "user", "content": user_prompt}]
     final_text = ""
     sources: list[dict] = []
     seen: set[str] = set()
+    tried_queries: list[str] = []
+
+    def _do_search(query: str) -> list[dict]:
+        if query_transform:
+            query = query_transform(query)
+        tried_queries.append(query)
+        if on_search:
+            on_search(query)
+        else:
+            print(f"[검색] {query}")
+        hits = web_search(query)
+        for h in hits:
+            if h["url"] and h["url"] not in seen:
+                seen.add(h["url"])
+                sources.append(h)
+        return hits
 
     for _ in range(max_turns):
         response = client.messages.create(
@@ -187,20 +262,7 @@ def run_search_loop(
         tool_results = []
         for block in response.content:
             if block.type == "tool_use" and block.name == "web_search":
-                query = block.input["query"]
-                if query_transform:
-                    query = query_transform(query)
-                if on_search:
-                    on_search(query)
-                else:
-                    print(f"[검색] {query}")
-
-                hits = web_search(query)
-                for h in hits:
-                    if h["url"] and h["url"] not in seen:
-                        seen.add(h["url"])
-                        sources.append(h)
-
+                hits = _do_search(block.input["query"])
                 tool_results.append(
                     {
                         "type": "tool_result",
@@ -211,6 +273,16 @@ def run_search_loop(
 
         messages.append({"role": "user", "content": tool_results})
 
+    # 결과가 부족하면 새 검색어로 딱 1회 재시도
+    search_retried = False
+    if retry_on_thin and len(sources) <= min_results:
+        new_keywords = _suggest_retry_keywords(
+            client, model, user_prompt, tried_queries
+        )
+        if new_keywords:
+            search_retried = True
+            _do_search(new_keywords)
+
     # 신뢰 소스를 출처 목록 상단으로
     sources.sort(key=lambda h: not h.get("trusted"))
-    return final_text, sources
+    return {"text": final_text, "sources": sources, "search_retried": search_retried}

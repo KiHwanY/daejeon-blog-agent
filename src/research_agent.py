@@ -39,14 +39,14 @@ SYSTEM_PROMPT = (
 
 def run_agent(user_question: str, max_turns: int = 5) -> str:
     """질문을 받아 tool-use 루프를 돌며 최종 답변을 반환"""
-    answer, _sources = run_search_loop(
+    result = run_search_loop(
         client,
         user_question,
         SYSTEM_PROMPT,
         max_turns=max_turns,
         max_tokens=1500,
     )
-    return answer
+    return result["text"]
 
 
 if __name__ == "__main__":
