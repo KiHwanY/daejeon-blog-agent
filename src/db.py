@@ -51,10 +51,15 @@ SCHEMA_STATEMENTS = [
         outline       TEXT,
         draft         TEXT,
         final_content TEXT,
+        tone          TEXT,
+        seo_keywords  TEXT,
         embedding     vector(768),
         created_at    TIMESTAMP DEFAULT now()
     );
     """,
+    # 기존 blog_posts 테이블을 위한 컬럼 추가 (멱등)
+    "ALTER TABLE blog_posts ADD COLUMN IF NOT EXISTS tone TEXT;",
+    "ALTER TABLE blog_posts ADD COLUMN IF NOT EXISTS seo_keywords TEXT;",
     """
     CREATE TABLE IF NOT EXISTS search_cache (
         id           SERIAL PRIMARY KEY,
@@ -137,7 +142,62 @@ def find_similar_post(topic: str, threshold: float = SIMILARITY_THRESHOLD):
     return {"topic": row[0], "final_content": row[1], "similarity": similarity}
 
 
-def save_blog_post(topic, outline, draft, final_content, embedding=None) -> int:
+def find_similar_posts(
+    topic: str, threshold: float = SIMILARITY_THRESHOLD, limit: int = 6
+) -> list[dict]:
+    """topic 과 유사한 글들을 유사도 내림차순으로 최대 limit 개 반환한다.
+
+    각 항목: {id, topic, final_content, tone, seo_keywords, created_at, similarity}
+    유사도가 threshold 미만인 글은 제외한다.
+    """
+    vec_literal = _to_vector_literal(embed_text(topic))
+
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, topic, final_content, tone, seo_keywords, created_at,
+                       1 - (embedding <=> %(v)s::vector) AS similarity
+                FROM blog_posts
+                WHERE embedding IS NOT NULL
+                ORDER BY embedding <=> %(v)s::vector
+                LIMIT %(lim)s;
+                """,
+                {"v": vec_literal, "lim": limit},
+            )
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    posts = []
+    for r in rows:
+        similarity = float(r[6])
+        if similarity < threshold:
+            continue
+        posts.append(
+            {
+                "id": r[0],
+                "topic": r[1],
+                "final_content": r[2],
+                "tone": r[3],
+                "seo_keywords": r[4],
+                "created_at": r[5],
+                "similarity": similarity,
+            }
+        )
+    return posts
+
+
+def save_blog_post(
+    topic,
+    outline,
+    draft,
+    final_content,
+    embedding=None,
+    tone=None,
+    seo_keywords=None,
+) -> int:
     """완성된 글을 blog_posts 에 저장하고 새 id 를 반환한다."""
     vec_literal = _to_vector_literal(embedding) if embedding is not None else None
 
@@ -148,11 +208,15 @@ def save_blog_post(topic, outline, draft, final_content, embedding=None) -> int:
                 cur.execute(
                     """
                     INSERT INTO blog_posts
-                        (topic, outline, draft, final_content, embedding)
-                    VALUES (%s, %s, %s, %s, %s::vector)
+                        (topic, outline, draft, final_content,
+                         tone, seo_keywords, embedding)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s::vector)
                     RETURNING id;
                     """,
-                    (topic, outline, draft, final_content, vec_literal),
+                    (
+                        topic, outline, draft, final_content,
+                        tone, seo_keywords, vec_literal,
+                    ),
                 )
                 new_id = cur.fetchone()[0]
     finally:
