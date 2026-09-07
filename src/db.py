@@ -63,6 +63,7 @@ SCHEMA_STATEMENTS = [
     # 기존 blog_posts 테이블을 위한 컬럼 추가 (멱등)
     "ALTER TABLE blog_posts ADD COLUMN IF NOT EXISTS tone TEXT;",
     "ALTER TABLE blog_posts ADD COLUMN IF NOT EXISTS seo_keywords TEXT;",
+    "ALTER TABLE blog_posts ADD COLUMN IF NOT EXISTS image_url TEXT;",
     """
     CREATE TABLE IF NOT EXISTS search_cache (
         id           SERIAL PRIMARY KEY,
@@ -129,7 +130,8 @@ def find_similar_posts(
 ) -> list[dict]:
     """topic 과 유사한 글들을 유사도 내림차순으로 최대 limit 개 반환한다.
 
-    각 항목: {id, topic, final_content, tone, seo_keywords, created_at, similarity}
+    각 항목: {id, topic, final_content, tone, seo_keywords, image_url,
+             created_at, similarity}
     유사도가 threshold 미만인 글은 제외한다.
     """
     vec_literal = _to_vector_literal(embed_text(topic))
@@ -139,7 +141,8 @@ def find_similar_posts(
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT id, topic, final_content, tone, seo_keywords, created_at,
+                SELECT id, topic, final_content, tone, seo_keywords, image_url,
+                       created_at,
                        1 - (embedding <=> %(v)s::vector) AS similarity
                 FROM blog_posts
                 WHERE embedding IS NOT NULL
@@ -154,7 +157,7 @@ def find_similar_posts(
 
     posts = []
     for r in rows:
-        similarity = float(r[6])
+        similarity = float(r[7])
         if similarity < threshold:
             continue
         posts.append(
@@ -164,7 +167,8 @@ def find_similar_posts(
                 "final_content": r[2],
                 "tone": r[3],
                 "seo_keywords": r[4],
-                "created_at": r[5],
+                "image_url": r[5],
+                "created_at": r[6],
                 "similarity": similarity,
             }
         )
@@ -179,6 +183,7 @@ def save_blog_post(
     embedding=None,
     tone=None,
     seo_keywords=None,
+    image_url=None,
 ) -> int:
     """완성된 글을 blog_posts 에 저장하고 새 id 를 반환한다."""
     vec_literal = _to_vector_literal(embedding) if embedding is not None else None
@@ -191,13 +196,13 @@ def save_blog_post(
                     """
                     INSERT INTO blog_posts
                         (topic, outline, draft, final_content,
-                         tone, seo_keywords, embedding)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s::vector)
+                         tone, seo_keywords, image_url, embedding)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s::vector)
                     RETURNING id;
                     """,
                     (
                         topic, outline, draft, final_content,
-                        tone, seo_keywords, vec_literal,
+                        tone, seo_keywords, image_url, vec_literal,
                     ),
                 )
                 new_id = cur.fetchone()[0]

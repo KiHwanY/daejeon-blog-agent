@@ -34,7 +34,7 @@ st.caption(
 RESULT_KEYS = (
     "topic", "mode", "similar_posts", "final_content",
     "research", "sources", "outline", "draft", "post_id",
-    "tone", "seo_keywords", "seo_report",
+    "tone", "seo_keywords", "seo_report", "image_url",
 )
 
 TONE_OPTIONS = ["정보성", "캐주얼", "리뷰형", "전문적"]
@@ -95,7 +95,9 @@ def _plain_excerpt(md: str, n: int = 160) -> str:
 
 
 def _card_image_url(post: dict) -> str:
-    """글 본문의 첫 이미지 URL, 없으면 주제 기반 대체 이미지."""
+    """카드 이미지 URL: Pexels image_url → 본문 첫 이미지 → 주제 기반 플레이스홀더."""
+    if post.get("image_url"):
+        return post["image_url"]
     m = re.search(r"!\[[^\]]*\]\((https?://[^)\s]+)\)", post.get("final_content") or "")
     if m:
         return m.group(1)
@@ -207,6 +209,7 @@ _STAGE_LABELS = {
     "research": ("1/3 · 리서치 중 (웹 검색)...", "1/3 · 리서치 완료"),
     "outline": ("2/3 · 아웃라인 작성 중...", "2/3 · 아웃라인 완료"),
     "draft": ("3/3 · 블로그 초안 작성 중...", "3/3 · 초안 완료"),
+    "image": ("이미지 검색 중 (Pexels)...", "이미지 준비 완료"),
     "save": ("저장 중 (임베딩 생성 + DB 저장)...", "저장 완료"),
 }
 
@@ -228,6 +231,8 @@ def _run_pipeline(topic_text: str, tone: str, seo_raw: str) -> dict:
                 return
             if stage == "save" and ev.get("post_id"):
                 done_label = f"blog_posts #{ev['post_id']} 저장 완료"
+            elif stage == "image" and not ev.get("image_url"):
+                done_label = "이미지 없음 (플레이스홀더 사용)"
             widget.update(label=done_label, state="complete", expanded=False)
 
     def on_search(query: str) -> None:
@@ -253,7 +258,7 @@ def _stash_result(result: dict) -> None:
 
     st.session_state["mode"] = "new"
     for key in ("research", "sources", "outline", "draft",
-                "final_content", "post_id", "seo_report"):
+                "final_content", "post_id", "seo_report", "image_url"):
         st.session_state[key] = result[key]
 
 
@@ -307,6 +312,13 @@ elif mode == "new":
         f"새 글을 생성했습니다. (톤: {st.session_state.get('tone')} · "
         f"blog_posts #{st.session_state.get('post_id')} 저장됨)"
     )
+
+    hero = _card_image_url({
+        "image_url": st.session_state.get("image_url"),
+        "final_content": st.session_state.get("draft"),
+        "topic": topic_done,
+    })
+    st.image(hero, use_container_width=True)
 
     st.subheader("1. 리서치 결과")
     st.markdown(st.session_state["research"])

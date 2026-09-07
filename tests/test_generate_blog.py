@@ -21,12 +21,13 @@ def _stub_pipeline(monkeypatch, *, similar=None, post_id=99):
         ),
     )
     monkeypatch.setattr(b, "persist_blog", lambda *a, **k: post_id)
+    monkeypatch.setattr(b, "get_topic_image", lambda topic: "https://img.example/x.jpg")
 
 
 EXPECTED_KEYS = {
     "existing", "similar_posts", "post_id", "similarity", "topic", "tone",
     "seo_keywords", "seo_report", "research", "sources", "outline", "draft",
-    "final_content",
+    "final_content", "image_url",
 }
 
 
@@ -40,11 +41,15 @@ class TestNewArticlePath:
             ("research", "start"), ("research", "done"),
             ("outline", "start"), ("outline", "done"),
             ("draft", "start"), ("draft", "done"),
+            ("image", "start"), ("image", "done"),
             ("save", "start"), ("save", "done"),
         ]
         # draft start 이벤트에 tone 이 실린다
         draft_start = next(e for e in events if e["stage"] == "draft" and e["state"] == "start")
         assert draft_start["tone"] == "리뷰형"
+        # image done 이벤트에 image_url 이 실린다
+        image_done = next(e for e in events if e["stage"] == "image" and e["state"] == "done")
+        assert image_done["image_url"] == "https://img.example/x.jpg"
 
     def test_result_shape_and_values(self, monkeypatch):
         _stub_pipeline(monkeypatch, post_id=123)
@@ -56,6 +61,7 @@ class TestNewArticlePath:
         assert r["final_content"] == r["draft"]
         assert r["seo_report"] == {"성심당": 3, "없는키워드": 0}
         assert r["tone"] == "정보성"
+        assert r["image_url"] == "https://img.example/x.jpg"
 
     def test_on_search_forwarded(self, monkeypatch):
         _stub_pipeline(monkeypatch)
@@ -73,11 +79,11 @@ class TestExistingArticlePath:
     def _posts(self):
         return [
             {"id": 7, "topic": "성심당 명물", "final_content": "성심당 본문 성심당",
-             "tone": "정보성", "seo_keywords": None, "created_at": "2026-09-01",
-             "similarity": 0.93},
+             "tone": "정보성", "seo_keywords": None, "image_url": "https://img/7.jpg",
+             "created_at": "2026-09-01", "similarity": 0.93},
             {"id": 8, "topic": "대전 빵집 지도", "final_content": "다른 글",
-             "tone": None, "seo_keywords": None, "created_at": "2026-08-01",
-             "similarity": 0.87},
+             "tone": None, "seo_keywords": None, "image_url": None,
+             "created_at": "2026-08-01", "similarity": 0.87},
         ]
 
     def test_returns_existing_without_running_pipeline(self, monkeypatch):
@@ -99,6 +105,7 @@ class TestExistingArticlePath:
         assert r["topic"] == "성심당 명물"
         assert r["final_content"] == "성심당 본문 성심당"
         assert r["seo_report"] == {"성심당": 2}
+        assert r["image_url"] == "https://img/7.jpg"  # 최상위 유사 글의 이미지
 
     def test_similar_done_event_carries_posts(self, monkeypatch):
         _stub_pipeline(monkeypatch, similar=self._posts())

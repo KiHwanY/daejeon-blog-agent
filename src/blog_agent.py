@@ -21,6 +21,7 @@ from dotenv import load_dotenv
 from config import DEFAULT_REGION, MODEL, SIMILARITY_THRESHOLD
 from db import find_similar_posts, save_blog_post
 from embeddings import embed_text
+from images import get_topic_image
 from search_tools import last_text, run_search_loop
 
 # 프로젝트 루트(혹은 상위 경로)의 .env 파일에서 환경변수를 읽어온다.
@@ -208,8 +209,9 @@ def persist_blog(
     final_content: str | None = None,
     tone: str | None = None,
     seo_keywords=None,
+    image_url: str | None = None,
 ) -> int:
-    """완성된 글을 임베딩(주제 기준)·톤·SEO 키워드와 함께 blog_posts 에 저장하고 id 반환."""
+    """완성된 글을 임베딩(주제 기준)·톤·SEO 키워드·이미지와 함께 blog_posts 에 저장하고 id 반환."""
     final_content = draft if final_content is None else final_content
     return save_blog_post(
         topic=topic,
@@ -219,13 +221,14 @@ def persist_blog(
         embedding=embed_text(topic),
         tone=tone,
         seo_keywords=keywords_to_str(seo_keywords),
+        image_url=image_url,
     )
 
 
 def _emit(on_stage, stage: str, state: str, **data) -> None:
     """진행 상황 콜백 헬퍼. on_stage 가 있으면 {stage, state, ...} 이벤트를 넘긴다.
 
-    stage: "similar" | "research" | "outline" | "draft" | "save"
+    stage: "similar" | "research" | "outline" | "draft" | "image" | "save"
     state: "start" | "done"
     """
     if on_stage:
@@ -277,6 +280,7 @@ def generate_blog(
             "seo_keywords": keywords,
             "seo_report": count_keyword_occurrences(top["final_content"], keywords),
             "final_content": top["final_content"],
+            "image_url": top.get("image_url"),
             # 하위 호환 필드
             "research": "",
             "sources": [],
@@ -301,9 +305,16 @@ def generate_blog(
 
     seo_report = count_keyword_occurrences(draft, keywords)
 
-    # 4단계: 임베딩·톤·SEO 키워드와 함께 저장
+    # 4단계: 주제에 어울리는 대표 이미지 검색 (실패해도 진행)
+    _emit(on_stage, "image", "start")
+    image_url = get_topic_image(topic)
+    _emit(on_stage, "image", "done", image_url=image_url)
+
+    # 5단계: 임베딩·톤·SEO 키워드·이미지와 함께 저장
     _emit(on_stage, "save", "start")
-    post_id = persist_blog(topic, outline, draft, tone=tone, seo_keywords=keywords)
+    post_id = persist_blog(
+        topic, outline, draft, tone=tone, seo_keywords=keywords, image_url=image_url
+    )
     _emit(on_stage, "save", "done", post_id=post_id)
 
     return {
@@ -320,6 +331,7 @@ def generate_blog(
         "outline": outline,
         "draft": draft,
         "final_content": draft,
+        "image_url": image_url,
     }
 
 

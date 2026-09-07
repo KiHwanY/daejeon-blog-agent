@@ -4,6 +4,13 @@
 (`src/` 가 import 경로에 있으므로 `from config import ...` 로 가져온다.)
 """
 
+import os
+
+from dotenv import load_dotenv
+
+# 환경변수 기반 설정이 채워지도록 .env 를 먼저 읽는다.
+load_dotenv()
+
 # Claude 모델 ID
 MODEL = "claude-sonnet-5"
 
@@ -18,3 +25,8 @@ SEARCH_CACHE_TTL_HOURS = 24 * 7
 
 # 사용자의 기본 지역 맥락
 DEFAULT_REGION = "대전"
+
+# Pexels 이미지 검색 (https://www.pexels.com/api/).
+# 키가 없으면 이미지 기능은 자동으로 비활성화되고 플레이스홀더로 대체된다.
+PEXELS_API_KEY = os.environ.get("PEXELS_API_KEY")
+PEXELS_SEARCH_URL = "https://api.pexels.com/v1/search"
