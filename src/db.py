@@ -7,6 +7,7 @@ PostgreSQL(pgvector) 연결 및 스키마 초기화
   python src/db.py        # vector 확장 + 테이블 생성 + 기본 도메인 시딩 + 검증 출력
 """
 
+import json
 import os
 
 import psycopg2
@@ -19,6 +20,12 @@ load_dotenv()
 
 # 유사 글로 간주하는 코사인 유사도 하한
 SIMILARITY_THRESHOLD = 0.85
+
+# 검색 캐시를 재사용하는 코사인 유사도 하한(검색어는 거의 동일할 때만 재사용)
+SEARCH_CACHE_SIMILARITY = 0.97
+
+# 검색 캐시 유효 시간(시간). 이보다 오래된 캐시는 무시한다.
+SEARCH_CACHE_TTL_HOURS = 24 * 7
 
 
 def get_connection():
@@ -217,6 +224,98 @@ def save_blog_post(
                         topic, outline, draft, final_content,
                         tone, seo_keywords, vec_literal,
                     ),
+                )
+                new_id = cur.fetchone()[0]
+    finally:
+        conn.close()
+    return new_id
+
+
+def get_trusted_sources() -> list[dict]:
+    """trusted_sources 목록을 [{domain, name, category}, ...] 로 반환한다.
+
+    DB 접속/조회에 실패하면 빈 리스트를 반환한다(검색 자체는 계속 동작하도록).
+    """
+    try:
+        conn = get_connection()
+    except Exception:  # noqa: BLE001 - DB 미가동 시 신뢰 소스 없이 진행
+        return []
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT domain, name, category FROM trusted_sources "
+                "WHERE domain IS NOT NULL AND domain <> '';"
+            )
+            rows = cur.fetchall()
+    except Exception:  # noqa: BLE001
+        return []
+    finally:
+        conn.close()
+
+    return [{"domain": r[0], "name": r[1], "category": r[2]} for r in rows]
+
+
+def find_cached_search(
+    query: str,
+    threshold: float = SEARCH_CACHE_SIMILARITY,
+    ttl_hours: int = SEARCH_CACHE_TTL_HOURS,
+):
+    """search_cache 에서 query 와 (거의) 동일한 최근 검색 결과를 찾아 반환한다.
+
+    검색어가 정확히 같거나 임베딩 유사도가 threshold 이상이고,
+    캐시가 ttl_hours 이내면 결과 리스트([{title,url,snippet}, ...])를,
+    없으면 None 을 반환한다.
+    """
+    vec_literal = _to_vector_literal(embed_text(query))
+
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT query,
+                       results_json,
+                       1 - (embedding <=> %(v)s::vector) AS similarity
+                FROM search_cache
+                WHERE embedding IS NOT NULL
+                  AND created_at > now() - make_interval(hours => %(ttl)s)
+                ORDER BY embedding <=> %(v)s::vector
+                LIMIT 1;
+                """,
+                {"v": vec_literal, "ttl": ttl_hours},
+            )
+            row = cur.fetchone()
+    finally:
+        conn.close()
+
+    if row is None:
+        return None
+
+    cached_query, results_json, similarity = row[0], row[1], float(row[2])
+    if cached_query != query and similarity < threshold:
+        return None
+    try:
+        return json.loads(results_json) if results_json else []
+    except (TypeError, ValueError):
+        return None
+
+
+def save_search_cache(query: str, results: list[dict], embedding=None) -> int:
+    """검색 결과를 search_cache 에 저장하고 새 id 를 반환한다."""
+    vec_literal = _to_vector_literal(embedding) if embedding is not None else None
+    payload = json.dumps(results, ensure_ascii=False)
+
+    conn = get_connection()
+    try:
+        with conn:  # 예외 없이 끝나면 커밋
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO search_cache (query, results_json, embedding)
+                    VALUES (%s, %s, %s::vector)
+                    RETURNING id;
+                    """,
+                    (query, payload, vec_literal),
                 )
                 new_id = cur.fetchone()[0]
     finally:

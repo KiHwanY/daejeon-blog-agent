@@ -14,12 +14,21 @@ Streamlit 프론트엔드:
 
 import os
 import re
+from functools import lru_cache
+from urllib.parse import urlparse
 
 from anthropic import Anthropic
 from ddgs import DDGS
 from dotenv import load_dotenv
 
-from db import find_similar_post, find_similar_posts, save_blog_post
+from db import (
+    find_cached_search,
+    find_similar_post,
+    find_similar_posts,
+    get_trusted_sources,
+    save_blog_post,
+    save_search_cache,
+)
 from embeddings import embed_text
 
 # 프로젝트 루트(혹은 상위 경로)의 .env 파일에서 환경변수를 읽어온다.
@@ -140,15 +149,78 @@ TOOLS = [
 ]
 
 
-def _web_search(query: str, max_results: int = 5) -> list[dict]:
-    """DuckDuckGo 웹 검색 실행 → [{title, url, snippet}, ...] 반환"""
+@lru_cache(maxsize=1)
+def _trusted_sources() -> tuple[tuple[str, str], ...]:
+    """trusted_sources 를 (도메인, 표시명) 튜플 목록으로 캐시한다(DB 조회 1회).
+
+    DB가 없거나 비어 있으면 빈 튜플 → 신뢰 소스 가점 없이 그대로 진행.
+    """
+    return tuple(
+        (s["domain"].lower(), s.get("name") or s["domain"])
+        for s in get_trusted_sources()
+        if s.get("domain")
+    )
+
+
+def _match_trusted(url: str) -> str | None:
+    """url 이 신뢰 도메인(또는 그 하위 도메인)이면 표시명을, 아니면 None 을 반환한다."""
+    try:
+        host = urlparse(url).netloc.lower()
+    except ValueError:
+        return None
+    host = host.split("@")[-1].split(":")[0]
+    if host.startswith("www."):
+        host = host[4:]
+    if not host:
+        return None
+    for domain, name in _trusted_sources():
+        if host == domain or host.endswith("." + domain):
+            return name
+    return None
+
+
+def _annotate_trust(hits: list[dict]) -> list[dict]:
+    """각 검색 결과에 trusted(bool)·source_name 을 덧붙인다."""
+    annotated = []
+    for h in hits:
+        name = _match_trusted(h.get("url") or "")
+        annotated.append({**h, "trusted": bool(name), "source_name": name})
+    return annotated
+
+
+def _web_search(
+    query: str, max_results: int = 5, use_cache: bool = True
+) -> list[dict]:
+    """DuckDuckGo 웹 검색 실행 → [{title, url, snippet, trusted, source_name}, ...] 반환
+
+    use_cache=True 면 search_cache 를 먼저 조회하고, 신규 검색 결과는 캐시에 저장한다.
+    신뢰 소스 표시는 캐시된 결과에도 조회 시점 기준으로 다시 계산한다.
+    """
+    q_embedding = None
+    if use_cache:
+        try:
+            q_embedding = embed_text(query)
+            cached = find_cached_search(query)
+        except Exception:  # noqa: BLE001 - 캐시 실패는 무시하고 실검색으로
+            cached = None
+        if cached is not None:
+            return _annotate_trust(cached)
+
     try:
         with DDGS() as ddgs:
             results = list(ddgs.text(query, max_results=max_results))
     except Exception as e:  # noqa: BLE001 - 검색 실패는 도구 결과로 전달
-        return [{"title": "", "url": "", "snippet": f"검색 중 오류가 발생했습니다: {e}"}]
+        return [
+            {
+                "title": "",
+                "url": "",
+                "snippet": f"검색 중 오류가 발생했습니다: {e}",
+                "trusted": False,
+                "source_name": None,
+            }
+        ]
 
-    return [
+    raw_hits = [
         {
             "title": r.get("title") or "",
             "url": r.get("href") or "",
@@ -157,14 +229,25 @@ def _web_search(query: str, max_results: int = 5) -> list[dict]:
         for r in results
     ]
 
+    if use_cache and q_embedding is not None:
+        try:
+            save_search_cache(query, raw_hits, embedding=q_embedding)
+        except Exception:  # noqa: BLE001 - 캐시 저장 실패는 조용히 무시
+            pass
+
+    return _annotate_trust(raw_hits)
+
 
 def _format_hits(hits: list[dict]) -> str:
     if not hits:
         return "검색 결과가 없습니다."
+    # 신뢰 소스를 먼저 노출해 모델이 우선 참고하도록 한다
+    ordered = sorted(hits, key=lambda h: not h.get("trusted"))
     lines = []
-    for h in hits:
+    for h in ordered:
+        tag = f" [신뢰 소스: {h['source_name']}]" if h.get("trusted") else ""
         lines.append(
-            f"- 제목: {h['title']}\n  URL: {h['url']}\n  요약: {h['snippet']}"
+            f"- 제목: {h['title']}{tag}\n  URL: {h['url']}\n  요약: {h['snippet']}"
         )
     return "\n".join(lines)
 
@@ -237,6 +320,8 @@ def _run_search_loop(
 
         messages.append({"role": "user", "content": tool_results})
 
+    # 신뢰 소스를 출처 목록 상단으로
+    sources.sort(key=lambda h: not h.get("trusted"))
     return final_text, sources
 
 
@@ -251,6 +336,8 @@ def research(topic: str, on_search=None) -> tuple[str, list[dict]]:
         + REGION_GUIDELINE
         + " 최신 정보나 사실 확인이 필요하면 반드시 web_search 도구를 사용하세요. "
         "지역 정보가 필요한 주제라면 검색어에 '대전'을 포함하세요. "
+        "검색 결과에 '[신뢰 소스: ...]'로 표시된 항목(대전시청·대전관광공사·지역 언론 등)은 "
+        "다른 출처보다 우선해서 인용하고, 사실이 엇갈리면 신뢰 소스를 기준으로 삼으세요. "
         "조사한 내용은 추측 없이 사실 위주로 불릿으로 정리하고, "
         "각 항목 끝에 참고한 출처 URL을 함께 적으세요."
     )

@@ -10,7 +10,10 @@ import html as html_lib
 import os
 import re
 import sys
+from contextlib import contextmanager
 
+import anthropic
+import psycopg2
 import streamlit as st
 
 # src/ 를 import 경로에 추가
@@ -152,6 +155,52 @@ def _render_seo_check() -> None:
         col.metric(kw, f"{cnt}회", delta, delta_color="off")
 
 
+def _friendly_error(e: Exception) -> str:
+    """예외를 사용자가 이해할 수 있는 한국어 안내 문구로 바꾼다."""
+    if isinstance(e, anthropic.AuthenticationError):
+        return (
+            "Anthropic API 키가 유효하지 않습니다. "
+            "프로젝트 루트 `.env` 의 `ANTHROPIC_API_KEY` 값을 확인하세요."
+        )
+    if isinstance(e, anthropic.PermissionDeniedError):
+        return (
+            "이 API 키로는 해당 모델을 사용할 수 없습니다. "
+            "Anthropic 콘솔에서 결제·권한 상태를 확인하세요."
+        )
+    if isinstance(e, anthropic.RateLimitError):
+        return (
+            "Anthropic API 사용량 한도(rate limit)에 걸렸습니다. "
+            "잠시 후 다시 시도하거나 콘솔에서 한도를 확인하세요."
+        )
+    if isinstance(e, anthropic.APIConnectionError):
+        return "Anthropic API 에 연결하지 못했습니다. 네트워크 상태를 확인하세요."
+    if isinstance(e, anthropic.APIStatusError):
+        return (
+            f"Anthropic API 오류가 발생했습니다 (HTTP {e.status_code}). "
+            "잠시 후 다시 시도하세요."
+        )
+    if isinstance(e, anthropic.APIError):
+        return f"Anthropic API 호출 중 오류가 발생했습니다: {e}"
+    if isinstance(e, psycopg2.OperationalError):
+        return (
+            "데이터베이스에 연결하지 못했습니다. Docker 컨테이너(`daejeon-blog-db`) 실행 여부와 "
+            "`.env` 의 `DB_*` 설정을 확인하세요."
+        )
+    if isinstance(e, psycopg2.Error):
+        return f"데이터베이스 오류가 발생했습니다: {e}"
+    return f"예상치 못한 오류가 발생했습니다: {e}"
+
+
+@contextmanager
+def _guard():
+    """블록 내부에서 발생한 예외를 안내 문구로 표시하고 실행을 멈춘다."""
+    try:
+        yield
+    except Exception as e:  # noqa: BLE001 - 사용자에게 보여줄 최종 방어선
+        st.error(_friendly_error(e))
+        st.stop()
+
+
 topic = st.text_input("블로그 주제", value="대전 성심당 빵집 추천")
 
 col1, col2 = st.columns(2)
@@ -177,59 +226,64 @@ if run and topic.strip():
     st.session_state["tone"] = tone
     st.session_state["seo_keywords"] = seo_raw
 
-    # --- 0단계: 임베딩 유사도로 기존 글 확인 ---
-    with st.spinner("기존 글 확인 중 (임베딩 유사도 검색)..."):
-        similar = blog_agent.find_similar_posts(t)
+    with _guard():
+        # --- 0단계: 임베딩 유사도로 기존 글 확인 ---
+        with st.spinner("기존 글 확인 중 (임베딩 유사도 검색)..."):
+            similar = blog_agent.find_similar_posts(t)
 
-    if similar:
-        st.session_state["mode"] = "existing"
-        st.session_state["similar_posts"] = similar
-        # SEO 체크는 가장 유사한 글 기준
-        st.session_state["final_content"] = similar[0]["final_content"]
-        st.session_state["seo_report"] = blog_agent.count_keyword_occurrences(
-            similar[0]["final_content"], seo_raw
-        )
-    else:
-        st.session_state["mode"] = "new"
-
-        # --- 1단계: 리서치 ---
-        with st.status("1/3 · 리서치 중 (웹 검색)...", expanded=True) as status:
-            searched: list[str] = []
-
-            def _on_search(q: str) -> None:
-                searched.append(q)
-                st.write(f"🔎 검색: `{q}`")
-
-            notes, sources = blog_agent.research(t, on_search=_on_search)
-            st.session_state["research"] = notes
-            st.session_state["sources"] = sources
-            status.update(label="1/3 · 리서치 완료", state="complete", expanded=False)
-
-        # --- 2단계: 아웃라인 ---
-        with st.status("2/3 · 아웃라인 작성 중...", expanded=False) as status:
-            outline = blog_agent.make_outline(t, notes)
-            st.session_state["outline"] = outline
-            status.update(label="2/3 · 아웃라인 완료", state="complete")
-
-        # --- 3단계: 초안 (톤 + SEO 키워드 반영) ---
-        with st.status(f"3/3 · 블로그 초안 작성 중 (톤: {tone})...", expanded=False) as status:
-            draft = blog_agent.write_draft(
-                t, outline, notes, tone=tone, seo_keywords=seo_raw
-            )
-            st.session_state["draft"] = draft
-            st.session_state["final_content"] = draft
+        if similar:
+            st.session_state["mode"] = "existing"
+            st.session_state["similar_posts"] = similar
+            # SEO 체크는 가장 유사한 글 기준
+            st.session_state["final_content"] = similar[0]["final_content"]
             st.session_state["seo_report"] = blog_agent.count_keyword_occurrences(
-                draft, seo_raw
+                similar[0]["final_content"], seo_raw
             )
-            status.update(label="3/3 · 초안 완료", state="complete")
+        else:
+            st.session_state["mode"] = "new"
 
-        # --- 4단계: 임베딩 + 톤 + SEO 키워드와 함께 DB 저장 ---
-        with st.status("저장 중 (임베딩 생성 + DB 저장)...", expanded=False) as status:
-            post_id = blog_agent.persist_blog(
-                t, outline, draft, tone=tone, seo_keywords=seo_raw
-            )
-            st.session_state["post_id"] = post_id
-            status.update(label=f"blog_posts #{post_id} 저장 완료", state="complete")
+            # --- 1단계: 리서치 ---
+            with st.status("1/3 · 리서치 중 (웹 검색)...", expanded=True) as status:
+                searched: list[str] = []
+
+                def _on_search(q: str) -> None:
+                    searched.append(q)
+                    st.write(f"🔎 검색: `{q}`")
+
+                notes, sources = blog_agent.research(t, on_search=_on_search)
+                st.session_state["research"] = notes
+                st.session_state["sources"] = sources
+                status.update(label="1/3 · 리서치 완료", state="complete", expanded=False)
+
+            # --- 2단계: 아웃라인 ---
+            with st.status("2/3 · 아웃라인 작성 중...", expanded=False) as status:
+                outline = blog_agent.make_outline(t, notes)
+                st.session_state["outline"] = outline
+                status.update(label="2/3 · 아웃라인 완료", state="complete")
+
+            # --- 3단계: 초안 (톤 + SEO 키워드 반영) ---
+            with st.status(
+                f"3/3 · 블로그 초안 작성 중 (톤: {tone})...", expanded=False
+            ) as status:
+                draft = blog_agent.write_draft(
+                    t, outline, notes, tone=tone, seo_keywords=seo_raw
+                )
+                st.session_state["draft"] = draft
+                st.session_state["final_content"] = draft
+                st.session_state["seo_report"] = blog_agent.count_keyword_occurrences(
+                    draft, seo_raw
+                )
+                status.update(label="3/3 · 초안 완료", state="complete")
+
+            # --- 4단계: 임베딩 + 톤 + SEO 키워드와 함께 DB 저장 ---
+            with st.status("저장 중 (임베딩 생성 + DB 저장)...", expanded=False) as status:
+                post_id = blog_agent.persist_blog(
+                    t, outline, draft, tone=tone, seo_keywords=seo_raw
+                )
+                st.session_state["post_id"] = post_id
+                status.update(
+                    label=f"blog_posts #{post_id} 저장 완료", state="complete"
+                )
 
 
 # --- 결과 표시 (생성 직후 & 재실행 시 모두) ---
@@ -258,11 +312,12 @@ elif mode == "new":
 
     sources = st.session_state.get("sources", [])
     if sources:
-        st.markdown("**검색된 출처**")
+        st.markdown("**검색된 출처** (✅ = 대전 신뢰 소스)")
         for s in sources:
             label = s.get("title") or s.get("url")
             if s.get("url"):
-                st.markdown(f"- [{label}]({s['url']})")
+                badge = f" ✅ {s['source_name']}" if s.get("trusted") else ""
+                st.markdown(f"- [{label}]({s['url']}){badge}")
 
     st.subheader("2. 아웃라인")
     st.markdown(st.session_state["outline"])
