@@ -10,5 +10,9 @@ __pycache__/
 *.pyc
 *.py[cod]
 
+# 테스트 / 린트 캐시
+.pytest_cache/
+.ruff_cache/
+
 # IDE
 .idea/

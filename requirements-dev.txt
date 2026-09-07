@@ -1,0 +1,8 @@
+# 개발/CI 전용 의존성 — 런타임 의존성은 requirements.txt 참고
+-r requirements.txt
+
+# 테스트
+pytest==8.3.4
+
+# 린트 / import 정렬
+ruff==0.8.4

@@ -35,9 +35,13 @@ PostgreSQL(pgvector)에 저장되며, 다음에 비슷한 주제가 들어오면
 ```
 daejeon-blog-agent/
 ├── app.py                  # Streamlit 프론트엔드 (진입점)
-├── requirements.txt        # 의존 패키지 (버전 고정)
+├── requirements.txt        # 런타임 의존 패키지 (버전 고정)
+├── requirements-dev.txt    # + pytest · ruff (개발/CI)
+├── pyproject.toml          # pytest · ruff 설정
 ├── .env.example            # 환경변수 템플릿 — 복사해서 .env 생성
 ├── .gitignore
+├── .github/workflows/ci.yml  # push/PR 시 ruff + pytest 실행
+├── tests/                  # 단위 테스트 (LLM/DB 모의)
 └── src/
     ├── config.py          # 공용 설정 상수 (모델 ID · 유사도 임계값 · 캐시 TTL 등)
     ├── search_tools.py    # web_search 도구 정의 + tool-use 검색 루프 (research/blog 공용)
@@ -52,8 +56,11 @@ DB 스키마(`src/db.py`가 생성):
 | 테이블 | 용도 | 주요 컬럼 |
 |---|---|---|
 | `trusted_sources` | 신뢰 도메인 목록 (대전 소스 4개 시드) | `domain` (UNIQUE), `name`, `category` |
-| `blog_posts` | 생성된 블로그 글 + 임베딩 | `topic`, `outline`, `draft`, `final_content`, `embedding vector(768)` |
-| `search_cache` | 검색 결과 캐시용 (예약) | `query`, `results_json`, `embedding vector(768)` |
+| `blog_posts` | 생성된 블로그 글 + 임베딩 | `topic`, `outline`, `draft`, `final_content`, `tone`, `seo_keywords`, `embedding vector(768)` |
+| `search_cache` | 웹 검색 결과 캐시 (검색어 임베딩으로 재사용) | `query`, `results_json`, `embedding vector(768)`, `created_at` |
+
+`blog_posts.embedding` · `search_cache.embedding` 에는 코사인 거리(`<=>`) 최근접 검색용 **HNSW 인덱스**가
+생성되어, 글이 늘어나도 유사도 조회가 순차 스캔으로 느려지지 않습니다.
 
 ## 설치 방법
 
@@ -150,6 +157,18 @@ python src/blog_agent.py
 # 단순 리서치 Q&A 에이전트
 python src/research_agent.py
 ```
+
+## 개발 / 테스트
+
+```bash
+pip install -r requirements-dev.txt   # 런타임 의존성 + pytest + ruff
+
+ruff check .                          # 린트 + import 정렬 검사
+pytest                                # 단위 테스트 (LLM/DB 없이 실행 가능)
+```
+
+테스트는 `tests/` 에 있으며 웹 검색·DB·Claude API 를 모두 모의(mock)하므로 키나 DB 없이 돌아갑니다.
+`main` 브랜치 push 와 모든 PR 에서 GitHub Actions(`.github/workflows/ci.yml`)가 위 두 명령을 실행합니다.
 
 ## 주의사항
 

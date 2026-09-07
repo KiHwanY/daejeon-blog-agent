@@ -72,6 +72,21 @@ SCHEMA_STATEMENTS = [
         created_at   TIMESTAMP DEFAULT now()
     );
     """,
+    # 코사인 거리(<=>) 최근접 검색용 HNSW 인덱스 (pgvector >= 0.5).
+    # 데이터가 많아져도 유사도 조회가 순차 스캔으로 느려지지 않도록 한다.
+    """
+    CREATE INDEX IF NOT EXISTS blog_posts_embedding_hnsw
+        ON blog_posts USING hnsw (embedding vector_cosine_ops);
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS search_cache_embedding_hnsw
+        ON search_cache USING hnsw (embedding vector_cosine_ops);
+    """,
+    # 검색 캐시 TTL 필터(created_at > now() - interval)용 인덱스
+    """
+    CREATE INDEX IF NOT EXISTS search_cache_created_at
+        ON search_cache (created_at DESC);
+    """,
 ]
 
 # trusted_sources 기본 시드 (대전 관련 도메인)
@@ -311,6 +326,17 @@ def _verify() -> None:
             )
             for row in cur.fetchall():
                 print("  ", row)
+
+            cur.execute(
+                """
+                SELECT indexname
+                FROM pg_indexes
+                WHERE schemaname = 'public'
+                  AND indexname LIKE '%embedding%'
+                ORDER BY indexname;
+                """
+            )
+            print("임베딩 인덱스:", [r[0] for r in cur.fetchall()])
     finally:
         conn.close()
 
