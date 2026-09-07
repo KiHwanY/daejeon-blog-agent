@@ -14,32 +14,19 @@ Streamlit 프론트엔드:
 
 import os
 import re
-from functools import lru_cache
-from urllib.parse import urlparse
 
 from anthropic import Anthropic
-from ddgs import DDGS
 from dotenv import load_dotenv
 
-from db import (
-    find_cached_search,
-    find_similar_post,
-    find_similar_posts,
-    get_trusted_sources,
-    save_blog_post,
-    save_search_cache,
-)
+from config import DEFAULT_REGION, MODEL, SIMILARITY_THRESHOLD
+from db import find_similar_posts, save_blog_post
 from embeddings import embed_text
+from search_tools import last_text, run_search_loop
 
 # 프로젝트 루트(혹은 상위 경로)의 .env 파일에서 환경변수를 읽어온다.
 load_dotenv()
 
 client = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
-
-MODEL = "claude-sonnet-5"
-
-# 유사 글로 간주하는 코사인 유사도 하한
-SIMILARITY_THRESHOLD = 0.85
 
 # 톤앤매너별 초안 작성 지시문
 TONE_INSTRUCTIONS = {
@@ -61,9 +48,6 @@ TONE_INSTRUCTIONS = {
     ),
 }
 DEFAULT_TONE = "정보성"
-
-# 사용자의 기본 지역 맥락
-DEFAULT_REGION = "대전"
 
 # 모든 단계의 시스템 프롬프트에 포함되는 지역 맥락 지침
 REGION_GUIDELINE = (
@@ -127,204 +111,6 @@ def count_keyword_occurrences(text, seo_keywords) -> dict:
     return {kw: text.count(kw) for kw in parse_keywords(seo_keywords)}
 
 
-# 에이전트가 사용할 도구 정의(스키마)
-TOOLS = [
-    {
-        "name": "web_search",
-        "description": (
-            "웹에서 최신 정보, 뉴스, 통계, 특정 주제에 대한 사실을 검색합니다. "
-            "모르는 내용이나 최신성이 중요한 질문에는 반드시 이 도구를 사용하세요."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "검색할 키워드. 짧고 구체적으로 작성하세요.",
-                }
-            },
-            "required": ["query"],
-        },
-    }
-]
-
-
-@lru_cache(maxsize=1)
-def _trusted_sources() -> tuple[tuple[str, str], ...]:
-    """trusted_sources 를 (도메인, 표시명) 튜플 목록으로 캐시한다(DB 조회 1회).
-
-    DB가 없거나 비어 있으면 빈 튜플 → 신뢰 소스 가점 없이 그대로 진행.
-    """
-    return tuple(
-        (s["domain"].lower(), s.get("name") or s["domain"])
-        for s in get_trusted_sources()
-        if s.get("domain")
-    )
-
-
-def _match_trusted(url: str) -> str | None:
-    """url 이 신뢰 도메인(또는 그 하위 도메인)이면 표시명을, 아니면 None 을 반환한다."""
-    try:
-        host = urlparse(url).netloc.lower()
-    except ValueError:
-        return None
-    host = host.split("@")[-1].split(":")[0]
-    if host.startswith("www."):
-        host = host[4:]
-    if not host:
-        return None
-    for domain, name in _trusted_sources():
-        if host == domain or host.endswith("." + domain):
-            return name
-    return None
-
-
-def _annotate_trust(hits: list[dict]) -> list[dict]:
-    """각 검색 결과에 trusted(bool)·source_name 을 덧붙인다."""
-    annotated = []
-    for h in hits:
-        name = _match_trusted(h.get("url") or "")
-        annotated.append({**h, "trusted": bool(name), "source_name": name})
-    return annotated
-
-
-def _web_search(
-    query: str, max_results: int = 5, use_cache: bool = True
-) -> list[dict]:
-    """DuckDuckGo 웹 검색 실행 → [{title, url, snippet, trusted, source_name}, ...] 반환
-
-    use_cache=True 면 search_cache 를 먼저 조회하고, 신규 검색 결과는 캐시에 저장한다.
-    신뢰 소스 표시는 캐시된 결과에도 조회 시점 기준으로 다시 계산한다.
-    """
-    q_embedding = None
-    if use_cache:
-        try:
-            q_embedding = embed_text(query)
-            cached = find_cached_search(query)
-        except Exception:  # noqa: BLE001 - 캐시 실패는 무시하고 실검색으로
-            cached = None
-        if cached is not None:
-            return _annotate_trust(cached)
-
-    try:
-        with DDGS() as ddgs:
-            results = list(ddgs.text(query, max_results=max_results))
-    except Exception as e:  # noqa: BLE001 - 검색 실패는 도구 결과로 전달
-        return [
-            {
-                "title": "",
-                "url": "",
-                "snippet": f"검색 중 오류가 발생했습니다: {e}",
-                "trusted": False,
-                "source_name": None,
-            }
-        ]
-
-    raw_hits = [
-        {
-            "title": r.get("title") or "",
-            "url": r.get("href") or "",
-            "snippet": r.get("body") or "",
-        }
-        for r in results
-    ]
-
-    if use_cache and q_embedding is not None:
-        try:
-            save_search_cache(query, raw_hits, embedding=q_embedding)
-        except Exception:  # noqa: BLE001 - 캐시 저장 실패는 조용히 무시
-            pass
-
-    return _annotate_trust(raw_hits)
-
-
-def _format_hits(hits: list[dict]) -> str:
-    if not hits:
-        return "검색 결과가 없습니다."
-    # 신뢰 소스를 먼저 노출해 모델이 우선 참고하도록 한다
-    ordered = sorted(hits, key=lambda h: not h.get("trusted"))
-    lines = []
-    for h in ordered:
-        tag = f" [신뢰 소스: {h['source_name']}]" if h.get("trusted") else ""
-        lines.append(
-            f"- 제목: {h['title']}{tag}\n  URL: {h['url']}\n  요약: {h['snippet']}"
-        )
-    return "\n".join(lines)
-
-
-def _text(response) -> str:
-    """응답에서 마지막 텍스트 블록을 뽑아 반환"""
-    out = ""
-    for block in response.content:
-        if block.type == "text" and block.text.strip():
-            out = block.text
-    return out
-
-
-def _run_search_loop(
-    user_prompt: str,
-    system_prompt: str,
-    max_turns: int = 5,
-    on_search=None,
-) -> tuple[str, list[dict]]:
-    """tool_use 루프를 돌며 (최종 텍스트, 출처 리스트) 반환
-
-    on_search: 검색이 실행될 때마다 호출되는 콜백 (localized_query: str) -> None
-    """
-    messages = [{"role": "user", "content": user_prompt}]
-    final_text = ""
-    sources: list[dict] = []
-    seen: set[str] = set()
-
-    for _ in range(max_turns):
-        response = client.messages.create(
-            model=MODEL,
-            max_tokens=3000,
-            system=system_prompt,
-            tools=TOOLS,
-            messages=messages,
-        )
-
-        block_text = _text(response)
-        if block_text:
-            final_text = block_text
-
-        if response.stop_reason != "tool_use":
-            break
-
-        messages.append({"role": "assistant", "content": response.content})
-
-        tool_results = []
-        for block in response.content:
-            if block.type == "tool_use" and block.name == "web_search":
-                # 2) 지역명이 필요한 검색어면 '대전'을 자동 포함
-                query = localize_query(block.input["query"])
-                if on_search:
-                    on_search(query)
-                else:
-                    print(f"[검색] {query}")
-
-                hits = _web_search(query)
-                for h in hits:
-                    if h["url"] and h["url"] not in seen:
-                        seen.add(h["url"])
-                        sources.append(h)
-
-                tool_results.append(
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": _format_hits(hits),
-                    }
-                )
-
-        messages.append({"role": "user", "content": tool_results})
-
-    # 신뢰 소스를 출처 목록 상단으로
-    sources.sort(key=lambda h: not h.get("trusted"))
-    return final_text, sources
-
-
 # --------------------------------------------------------------------------
 # 3단계 파이프라인
 # --------------------------------------------------------------------------
@@ -342,7 +128,13 @@ def research(topic: str, on_search=None) -> tuple[str, list[dict]]:
         "각 항목 끝에 참고한 출처 URL을 함께 적으세요."
     )
     prompt = f"다음 주제로 블로그 글을 쓰기 위한 리서치를 해주세요: {topic}"
-    return _run_search_loop(prompt, system, on_search=on_search)
+    return run_search_loop(
+        client,
+        prompt,
+        system,
+        on_search=on_search,
+        query_transform=localize_query,
+    )
 
 
 def make_outline(topic: str, research_notes: str) -> str:
@@ -360,7 +152,7 @@ def make_outline(topic: str, research_notes: str) -> str:
         system=system,
         messages=[{"role": "user", "content": prompt}],
     )
-    return _text(response)
+    return last_text(response)
 
 
 def write_draft(
@@ -406,7 +198,7 @@ def write_draft(
         system=system,
         messages=[{"role": "user", "content": prompt}],
     )
-    return _text(response)
+    return last_text(response)
 
 
 def persist_blog(
@@ -430,57 +222,93 @@ def persist_blog(
     )
 
 
+def _emit(on_stage, stage: str, state: str, **data) -> None:
+    """진행 상황 콜백 헬퍼. on_stage 가 있으면 {stage, state, ...} 이벤트를 넘긴다.
+
+    stage: "similar" | "research" | "outline" | "draft" | "save"
+    state: "start" | "done"
+    """
+    if on_stage:
+        on_stage({"stage": stage, "state": state, **data})
+
+
 def generate_blog(
     topic: str,
     on_search=None,
+    on_stage=None,
     threshold: float = SIMILARITY_THRESHOLD,
     reuse_existing: bool = True,
+    similar_limit: int = 6,
     tone: str = DEFAULT_TONE,
     seo_keywords=None,
 ) -> dict:
     """유사 글 확인 → (없으면) 리서치 → 아웃라인 → 초안 → 저장.
 
+    on_search: 검색 실행 때마다 호출 (query: str) -> None
+    on_stage:  단계 전환 때마다 호출 (event: dict) -> None
     tone: 초안 톤앤매너 (정보성/캐주얼/리뷰형/전문적)
     seo_keywords: 쉼표 구분 문자열 또는 리스트
 
-    반환 dict 의 "existing" 이 True 면 DB 의 기존 글을 재사용한 것이다.
+    반환 dict 의 "existing" 이 True 면 DB 의 기존 글을 재사용한 것이며,
+    이때 "similar_posts" 에 유사 글 목록이 함께 담긴다.
     "seo_report" 는 {키워드: 본문 등장 횟수}.
     """
     topic = topic.strip()
     keywords = parse_keywords(seo_keywords)
 
     # 0단계: 임베딩 유사도로 기존 글 확인
-    if reuse_existing:
-        found = find_similar_post(topic, threshold=threshold)
-        if found:
-            return {
-                "existing": True,
-                "similarity": found["similarity"],
-                "topic": found["topic"],
-                "final_content": found["final_content"],
-                "tone": None,
-                "seo_keywords": keywords,
-                "seo_report": count_keyword_occurrences(found["final_content"], keywords),
-                # 하위 호환 필드
-                "research": "",
-                "sources": [],
-                "outline": "",
-                "draft": found["final_content"],
-            }
+    _emit(on_stage, "similar", "start")
+    posts = (
+        find_similar_posts(topic, threshold=threshold, limit=similar_limit)
+        if reuse_existing
+        else []
+    )
+    _emit(on_stage, "similar", "done", posts=posts)
 
-    # 1~3단계: 리서치 → 아웃라인 → 초안(톤·SEO 반영)
+    if posts:
+        top = posts[0]
+        return {
+            "existing": True,
+            "similar_posts": posts,
+            "post_id": top.get("id"),
+            "similarity": top["similarity"],
+            "topic": top["topic"],
+            "tone": top.get("tone"),
+            "seo_keywords": keywords,
+            "seo_report": count_keyword_occurrences(top["final_content"], keywords),
+            "final_content": top["final_content"],
+            # 하위 호환 필드
+            "research": "",
+            "sources": [],
+            "outline": "",
+            "draft": top["final_content"],
+        }
+
+    # 1단계: 리서치
+    _emit(on_stage, "research", "start")
     notes, sources = research(topic, on_search=on_search)
-    outline = make_outline(topic, notes)
-    draft = write_draft(topic, outline, notes, tone=tone, seo_keywords=keywords)
+    _emit(on_stage, "research", "done", notes=notes, sources=sources)
 
-    # 5단계: SEO 키워드 등장 횟수 리포트
+    # 2단계: 아웃라인
+    _emit(on_stage, "outline", "start")
+    outline = make_outline(topic, notes)
+    _emit(on_stage, "outline", "done", outline=outline)
+
+    # 3단계: 초안(톤·SEO 반영)
+    _emit(on_stage, "draft", "start", tone=tone)
+    draft = write_draft(topic, outline, notes, tone=tone, seo_keywords=keywords)
+    _emit(on_stage, "draft", "done", draft=draft)
+
     seo_report = count_keyword_occurrences(draft, keywords)
 
-    # 4/6단계: 임베딩·톤·SEO 키워드와 함께 저장
+    # 4단계: 임베딩·톤·SEO 키워드와 함께 저장
+    _emit(on_stage, "save", "start")
     post_id = persist_blog(topic, outline, draft, tone=tone, seo_keywords=keywords)
+    _emit(on_stage, "save", "done", post_id=post_id)
 
     return {
         "existing": False,
+        "similar_posts": [],
         "post_id": post_id,
         "similarity": None,
         "topic": topic,

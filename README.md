@@ -38,8 +38,9 @@ daejeon-blog-agent/
 ├── requirements.txt        # 의존 패키지 (버전 고정)
 ├── .env.example            # 환경변수 템플릿 — 복사해서 .env 생성
 ├── .gitignore
-├── main.py                 # (미사용) PyCharm 기본 생성 파일
 └── src/
+    ├── config.py          # 공용 설정 상수 (모델 ID · 유사도 임계값 · 캐시 TTL 등)
+    ├── search_tools.py    # web_search 도구 정의 + tool-use 검색 루프 (research/blog 공용)
     ├── research_agent.py   # 웹 검색 tool-use 리서치 에이전트 (독립 실행형 Q&A)
     ├── blog_agent.py       # 리서치 → 아웃라인 → 초안 파이프라인 + 유사 글 중복 방지
     ├── db.py               # PostgreSQL/pgvector 연결 · 스키마 초기화 · 유사도 검색

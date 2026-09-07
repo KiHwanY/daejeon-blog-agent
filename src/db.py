@@ -13,19 +13,15 @@ import os
 import psycopg2
 from dotenv import load_dotenv
 
+from config import (
+    SEARCH_CACHE_SIMILARITY,
+    SEARCH_CACHE_TTL_HOURS,
+    SIMILARITY_THRESHOLD,
+)
 from embeddings import embed_text
 
 # 프로젝트 루트(혹은 상위 경로)의 .env 를 읽어온다.
 load_dotenv()
-
-# 유사 글로 간주하는 코사인 유사도 하한
-SIMILARITY_THRESHOLD = 0.85
-
-# 검색 캐시를 재사용하는 코사인 유사도 하한(검색어는 거의 동일할 때만 재사용)
-SEARCH_CACHE_SIMILARITY = 0.97
-
-# 검색 캐시 유효 시간(시간). 이보다 오래된 캐시는 무시한다.
-SEARCH_CACHE_TTL_HOURS = 24 * 7
 
 
 def get_connection():
@@ -111,42 +107,6 @@ def init_db() -> None:
 def _to_vector_literal(vec) -> str:
     """float 리스트를 pgvector 리터럴 문자열 '[v1,v2,...]' 로 변환한다."""
     return "[" + ",".join(str(float(x)) for x in vec) + "]"
-
-
-def find_similar_post(topic: str, threshold: float = SIMILARITY_THRESHOLD):
-    """topic 을 임베딩해 blog_posts 에서 코사인 거리(<=>)가 가장 가까운 글을 찾는다.
-
-    유사도(= 1 - 코사인거리)가 threshold 이상이면
-    {"topic", "final_content", "similarity"} 를, 그렇지 않으면 None 을 반환.
-    """
-    vec_literal = _to_vector_literal(embed_text(topic))
-
-    conn = get_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT topic,
-                       final_content,
-                       1 - (embedding <=> %(v)s::vector) AS similarity
-                FROM blog_posts
-                WHERE embedding IS NOT NULL
-                ORDER BY embedding <=> %(v)s::vector
-                LIMIT 1;
-                """,
-                {"v": vec_literal},
-            )
-            row = cur.fetchone()
-    finally:
-        conn.close()
-
-    if row is None:
-        return None
-
-    similarity = float(row[2])
-    if similarity < threshold:
-        return None
-    return {"topic": row[0], "final_content": row[1], "similarity": similarity}
 
 
 def find_similar_posts(

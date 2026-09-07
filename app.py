@@ -201,6 +201,62 @@ def _guard():
         st.stop()
 
 
+# 파이프라인 단계 → (진행 중 라벨, 완료 라벨)
+_STAGE_LABELS = {
+    "similar": ("기존 글 확인 중 (임베딩 유사도 검색)...", "기존 글 확인 완료"),
+    "research": ("1/3 · 리서치 중 (웹 검색)...", "1/3 · 리서치 완료"),
+    "outline": ("2/3 · 아웃라인 작성 중...", "2/3 · 아웃라인 완료"),
+    "draft": ("3/3 · 블로그 초안 작성 중...", "3/3 · 초안 완료"),
+    "save": ("저장 중 (임베딩 생성 + DB 저장)...", "저장 완료"),
+}
+
+
+def _run_pipeline(topic_text: str, tone: str, seo_raw: str) -> dict:
+    """blog_agent.generate_blog 를 단계별 st.status UI 콜백과 함께 호출한다."""
+    widgets: dict = {}
+
+    def on_stage(ev: dict) -> None:
+        stage, state = ev["stage"], ev["state"]
+        start_label, done_label = _STAGE_LABELS[stage]
+        if state == "start":
+            if stage == "draft" and ev.get("tone"):
+                start_label = f"3/3 · 블로그 초안 작성 중 (톤: {ev['tone']})..."
+            widgets[stage] = st.status(start_label, expanded=(stage == "research"))
+        elif state == "done":
+            widget = widgets.get(stage)
+            if widget is None:
+                return
+            if stage == "save" and ev.get("post_id"):
+                done_label = f"blog_posts #{ev['post_id']} 저장 완료"
+            widget.update(label=done_label, state="complete", expanded=False)
+
+    def on_search(query: str) -> None:
+        (widgets.get("research") or st).write(f"🔎 검색: `{query}`")
+
+    return blog_agent.generate_blog(
+        topic_text,
+        on_search=on_search,
+        on_stage=on_stage,
+        tone=tone,
+        seo_keywords=seo_raw,
+    )
+
+
+def _stash_result(result: dict) -> None:
+    """generate_blog 결과를 결과 표시 섹션이 읽는 session_state 키로 옮긴다."""
+    if result["existing"]:
+        st.session_state["mode"] = "existing"
+        st.session_state["similar_posts"] = result["similar_posts"]
+        st.session_state["final_content"] = result["final_content"]
+        st.session_state["seo_report"] = result["seo_report"]
+        return
+
+    st.session_state["mode"] = "new"
+    for key in ("research", "sources", "outline", "draft",
+                "final_content", "post_id", "seo_report"):
+        st.session_state[key] = result[key]
+
+
 topic = st.text_input("블로그 주제", value="대전 성심당 빵집 추천")
 
 col1, col2 = st.columns(2)
@@ -227,63 +283,8 @@ if run and topic.strip():
     st.session_state["seo_keywords"] = seo_raw
 
     with _guard():
-        # --- 0단계: 임베딩 유사도로 기존 글 확인 ---
-        with st.spinner("기존 글 확인 중 (임베딩 유사도 검색)..."):
-            similar = blog_agent.find_similar_posts(t)
-
-        if similar:
-            st.session_state["mode"] = "existing"
-            st.session_state["similar_posts"] = similar
-            # SEO 체크는 가장 유사한 글 기준
-            st.session_state["final_content"] = similar[0]["final_content"]
-            st.session_state["seo_report"] = blog_agent.count_keyword_occurrences(
-                similar[0]["final_content"], seo_raw
-            )
-        else:
-            st.session_state["mode"] = "new"
-
-            # --- 1단계: 리서치 ---
-            with st.status("1/3 · 리서치 중 (웹 검색)...", expanded=True) as status:
-                searched: list[str] = []
-
-                def _on_search(q: str) -> None:
-                    searched.append(q)
-                    st.write(f"🔎 검색: `{q}`")
-
-                notes, sources = blog_agent.research(t, on_search=_on_search)
-                st.session_state["research"] = notes
-                st.session_state["sources"] = sources
-                status.update(label="1/3 · 리서치 완료", state="complete", expanded=False)
-
-            # --- 2단계: 아웃라인 ---
-            with st.status("2/3 · 아웃라인 작성 중...", expanded=False) as status:
-                outline = blog_agent.make_outline(t, notes)
-                st.session_state["outline"] = outline
-                status.update(label="2/3 · 아웃라인 완료", state="complete")
-
-            # --- 3단계: 초안 (톤 + SEO 키워드 반영) ---
-            with st.status(
-                f"3/3 · 블로그 초안 작성 중 (톤: {tone})...", expanded=False
-            ) as status:
-                draft = blog_agent.write_draft(
-                    t, outline, notes, tone=tone, seo_keywords=seo_raw
-                )
-                st.session_state["draft"] = draft
-                st.session_state["final_content"] = draft
-                st.session_state["seo_report"] = blog_agent.count_keyword_occurrences(
-                    draft, seo_raw
-                )
-                status.update(label="3/3 · 초안 완료", state="complete")
-
-            # --- 4단계: 임베딩 + 톤 + SEO 키워드와 함께 DB 저장 ---
-            with st.status("저장 중 (임베딩 생성 + DB 저장)...", expanded=False) as status:
-                post_id = blog_agent.persist_blog(
-                    t, outline, draft, tone=tone, seo_keywords=seo_raw
-                )
-                st.session_state["post_id"] = post_id
-                status.update(
-                    label=f"blog_posts #{post_id} 저장 완료", state="complete"
-                )
+        result = _run_pipeline(t, tone, seo_raw)
+        _stash_result(result)
 
 
 # --- 결과 표시 (생성 직후 & 재실행 시 모두) ---
