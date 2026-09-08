@@ -1,0 +1,15 @@
+[tool.pytest.ini_options]
+# src/ 를 import 경로에 추가 (tests/conftest.py 와 동일 효과)
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = [".venv"]
+
+[tool.ruff.lint]
+# 기본(E, F) + isort(I). 한국어 문자열 폭 때문에 줄길이(E501)는 제외.
+select = ["E", "F", "I"]
+ignore = ["E501"]

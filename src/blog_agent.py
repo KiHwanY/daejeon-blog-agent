@@ -16,21 +16,18 @@ import os
 import re
 
 from anthropic import Anthropic
-from ddgs import DDGS
 from dotenv import load_dotenv
 
-from db import find_similar_post, find_similar_posts, save_blog_post
+from config import DEFAULT_REGION, MODEL, SIMILARITY_THRESHOLD
+from db import find_similar_posts, save_blog_post
 from embeddings import embed_text
+from images import get_topic_image
+from search_tools import extract_json, last_text, run_search_loop
 
 # 프로젝트 루트(혹은 상위 경로)의 .env 파일에서 환경변수를 읽어온다.
 load_dotenv()
 
 client = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
-
-MODEL = "claude-sonnet-5"
-
-# 유사 글로 간주하는 코사인 유사도 하한
-SIMILARITY_THRESHOLD = 0.85
 
 # 톤앤매너별 초안 작성 지시문
 TONE_INSTRUCTIONS = {
@@ -52,9 +49,6 @@ TONE_INSTRUCTIONS = {
     ),
 }
 DEFAULT_TONE = "정보성"
-
-# 사용자의 기본 지역 맥락
-DEFAULT_REGION = "대전"
 
 # 모든 단계의 시스템 프롬프트에 포함되는 지역 맥락 지침
 REGION_GUIDELINE = (
@@ -118,144 +112,40 @@ def count_keyword_occurrences(text, seo_keywords) -> dict:
     return {kw: text.count(kw) for kw in parse_keywords(seo_keywords)}
 
 
-# 에이전트가 사용할 도구 정의(스키마)
-TOOLS = [
-    {
-        "name": "web_search",
-        "description": (
-            "웹에서 최신 정보, 뉴스, 통계, 특정 주제에 대한 사실을 검색합니다. "
-            "모르는 내용이나 최신성이 중요한 질문에는 반드시 이 도구를 사용하세요."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "검색할 키워드. 짧고 구체적으로 작성하세요.",
-                }
-            },
-            "required": ["query"],
-        },
-    }
-]
-
-
-def _web_search(query: str, max_results: int = 5) -> list[dict]:
-    """DuckDuckGo 웹 검색 실행 → [{title, url, snippet}, ...] 반환"""
-    try:
-        with DDGS() as ddgs:
-            results = list(ddgs.text(query, max_results=max_results))
-    except Exception as e:  # noqa: BLE001 - 검색 실패는 도구 결과로 전달
-        return [{"title": "", "url": "", "snippet": f"검색 중 오류가 발생했습니다: {e}"}]
-
-    return [
-        {
-            "title": r.get("title") or "",
-            "url": r.get("href") or "",
-            "snippet": r.get("body") or "",
-        }
-        for r in results
-    ]
-
-
-def _format_hits(hits: list[dict]) -> str:
-    if not hits:
-        return "검색 결과가 없습니다."
-    lines = []
-    for h in hits:
-        lines.append(
-            f"- 제목: {h['title']}\n  URL: {h['url']}\n  요약: {h['snippet']}"
-        )
-    return "\n".join(lines)
-
-
-def _text(response) -> str:
-    """응답에서 마지막 텍스트 블록을 뽑아 반환"""
-    out = ""
-    for block in response.content:
-        if block.type == "text" and block.text.strip():
-            out = block.text
-    return out
-
-
-def _run_search_loop(
-    user_prompt: str,
-    system_prompt: str,
-    max_turns: int = 5,
-    on_search=None,
-) -> tuple[str, list[dict]]:
-    """tool_use 루프를 돌며 (최종 텍스트, 출처 리스트) 반환
-
-    on_search: 검색이 실행될 때마다 호출되는 콜백 (localized_query: str) -> None
-    """
-    messages = [{"role": "user", "content": user_prompt}]
-    final_text = ""
-    sources: list[dict] = []
-    seen: set[str] = set()
-
-    for _ in range(max_turns):
-        response = client.messages.create(
-            model=MODEL,
-            max_tokens=3000,
-            system=system_prompt,
-            tools=TOOLS,
-            messages=messages,
-        )
-
-        block_text = _text(response)
-        if block_text:
-            final_text = block_text
-
-        if response.stop_reason != "tool_use":
-            break
-
-        messages.append({"role": "assistant", "content": response.content})
-
-        tool_results = []
-        for block in response.content:
-            if block.type == "tool_use" and block.name == "web_search":
-                # 2) 지역명이 필요한 검색어면 '대전'을 자동 포함
-                query = localize_query(block.input["query"])
-                if on_search:
-                    on_search(query)
-                else:
-                    print(f"[검색] {query}")
-
-                hits = _web_search(query)
-                for h in hits:
-                    if h["url"] and h["url"] not in seen:
-                        seen.add(h["url"])
-                        sources.append(h)
-
-                tool_results.append(
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": _format_hits(hits),
-                    }
-                )
-
-        messages.append({"role": "user", "content": tool_results})
-
-    return final_text, sources
-
-
 # --------------------------------------------------------------------------
 # 3단계 파이프라인
 # --------------------------------------------------------------------------
 
-def research(topic: str, on_search=None) -> tuple[str, list[dict]]:
-    """1단계: 주제에 대한 리서치. (리서치 노트, 출처 리스트) 반환"""
+def research(topic: str, on_search=None) -> dict:
+    """1단계: 주제에 대한 리서치.
+
+    반환: {"notes": str, "sources": list[dict], "search_retried": bool}
+    유효 검색 결과가 2개 이하이면 새 검색어로 1회 자동 재시도한다.
+    """
     system = (
         "당신은 블로그 글감을 조사하는 리서치 에이전트입니다. "
         + REGION_GUIDELINE
         + " 최신 정보나 사실 확인이 필요하면 반드시 web_search 도구를 사용하세요. "
         "지역 정보가 필요한 주제라면 검색어에 '대전'을 포함하세요. "
+        "검색 결과에 '[신뢰 소스: ...]'로 표시된 항목(대전시청·대전관광공사·지역 언론 등)은 "
+        "다른 출처보다 우선해서 인용하고, 사실이 엇갈리면 신뢰 소스를 기준으로 삼으세요. "
         "조사한 내용은 추측 없이 사실 위주로 불릿으로 정리하고, "
         "각 항목 끝에 참고한 출처 URL을 함께 적으세요."
     )
     prompt = f"다음 주제로 블로그 글을 쓰기 위한 리서치를 해주세요: {topic}"
-    return _run_search_loop(prompt, system, on_search=on_search)
+    result = run_search_loop(
+        client,
+        prompt,
+        system,
+        on_search=on_search,
+        query_transform=localize_query,
+        retry_on_thin=True,
+    )
+    return {
+        "notes": result["text"],
+        "sources": result["sources"],
+        "search_retried": result["search_retried"],
+    }
 
 
 def make_outline(topic: str, research_notes: str) -> str:
@@ -273,7 +163,7 @@ def make_outline(topic: str, research_notes: str) -> str:
         system=system,
         messages=[{"role": "user", "content": prompt}],
     )
-    return _text(response)
+    return last_text(response)
 
 
 def write_draft(
@@ -319,7 +209,102 @@ def write_draft(
         system=system,
         messages=[{"role": "user", "content": prompt}],
     )
-    return _text(response)
+    return last_text(response)
+
+
+def critique_draft(
+    draft: str,
+    research_context: str,
+    tone: str = DEFAULT_TONE,
+    seo_keywords=None,
+) -> dict:
+    """초안을 리서치 근거·톤·SEO 기준으로 자체 평가한다.
+
+    반환: {"pass": bool, "feedback": str}
+    (모델 응답을 JSON 으로 파싱하지 못하면 통과 처리하고 그 사실을 feedback 에 남긴다.)
+    """
+    tone_instruction = TONE_INSTRUCTIONS.get(tone, TONE_INSTRUCTIONS[DEFAULT_TONE])
+    keywords = parse_keywords(seo_keywords)
+    kw_line = ", ".join(keywords) if keywords else "(지정 없음)"
+
+    system = (
+        "당신은 한국어 블로그 초안을 검수하는 엄격한 편집자입니다. "
+        "아래 네 가지 기준으로만 평가하세요.\n"
+        "1) 사실 정확성: 초안의 사실이 '리서치 근거'와 일치하는가, 근거에 없는 내용을 지어내지 않았는가.\n"
+        "2) 구조: 도입-본문-마무리 흐름이 논리적이고 소제목 구성이 자연스러운가.\n"
+        "3) 문체: 요청된 톤앤매너와 실제 문체가 일치하는가.\n"
+        "4) SEO: 지정된 키워드가 자연스럽게 반영됐는가(전혀 없거나, 억지로 반복하면 실패).\n"
+        "하나라도 눈에 띄게 미흡하면 pass 는 false 입니다. "
+        "반드시 JSON 한 개만 출력하세요: "
+        '{"pass": true 또는 false, "feedback": "구체적 지적 또는 통과 사유 1~3문장"}'
+    )
+    prompt = (
+        f"[요청한 톤앤매너] {tone}: {tone_instruction}\n"
+        f"[지정 SEO 키워드] {kw_line}\n\n"
+        f"[리서치 근거]\n{research_context or '(근거 없음)'}\n\n"
+        f"[검수할 초안]\n{draft}"
+    )
+    response = client.messages.create(
+        model=MODEL,
+        max_tokens=600,
+        system=system,
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+    data = extract_json(last_text(response))
+    if not data or "pass" not in data:
+        return {
+            "pass": True,
+            "feedback": "(자체 검토 응답을 해석하지 못해 통과 처리했습니다.)",
+        }
+    return {
+        "pass": bool(data.get("pass")),
+        "feedback": str(data.get("feedback") or "").strip(),
+    }
+
+
+def rewrite_draft(
+    topic: str,
+    outline: str,
+    research_notes: str,
+    previous_draft: str,
+    feedback: str,
+    tone: str = DEFAULT_TONE,
+    seo_keywords=None,
+) -> str:
+    """자체 검토 피드백을 반영해 초안을 1회 재작성한다."""
+    tone_instruction = TONE_INSTRUCTIONS.get(tone, TONE_INSTRUCTIONS[DEFAULT_TONE])
+    keywords = parse_keywords(seo_keywords)
+    seo_instruction = ""
+    if keywords:
+        seo_instruction = (
+            f" 다음 키워드를 제목과 본문에 자연스럽게 각각 3~5회 반영하세요: "
+            f"{', '.join(keywords)}."
+        )
+
+    system = (
+        "당신은 한국어 블로그 작가입니다. "
+        + REGION_GUIDELINE
+        + " 검수자의 피드백을 반영해 초안을 고쳐 씁니다. "
+        "리서치 노트에 없는 사실은 지어내지 말고, 마크다운으로 작성하세요."
+        + f" [톤앤매너] {tone_instruction}"
+        + seo_instruction
+    )
+    prompt = (
+        f"주제: {topic}\n\n"
+        f"아웃라인:\n{outline}\n\n"
+        f"리서치 노트:\n{research_notes}\n\n"
+        f"이전 초안:\n{previous_draft}\n\n"
+        f"검수 피드백(반드시 반영):\n{feedback}\n\n"
+        "위 피드백을 모두 반영해 800~1200자 분량의 완성된 블로그 글을 다시 작성하세요."
+    )
+    response = client.messages.create(
+        model=MODEL,
+        max_tokens=4000,
+        system=system,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return last_text(response)
 
 
 def persist_blog(
@@ -329,8 +314,13 @@ def persist_blog(
     final_content: str | None = None,
     tone: str | None = None,
     seo_keywords=None,
+    image_url: str | None = None,
+    critique_passed: bool | None = None,
+    critique_feedback: str | None = None,
+    was_rewritten: bool = False,
+    search_retried: bool = False,
 ) -> int:
-    """완성된 글을 임베딩(주제 기준)·톤·SEO 키워드와 함께 blog_posts 에 저장하고 id 반환."""
+    """완성된 글을 임베딩·톤·SEO·이미지·자체검토 메타와 함께 blog_posts 에 저장하고 id 반환."""
     final_content = draft if final_content is None else final_content
     return save_blog_post(
         topic=topic,
@@ -340,60 +330,142 @@ def persist_blog(
         embedding=embed_text(topic),
         tone=tone,
         seo_keywords=keywords_to_str(seo_keywords),
+        image_url=image_url,
+        critique_passed=critique_passed,
+        critique_feedback=critique_feedback,
+        was_rewritten=was_rewritten,
+        search_retried=search_retried,
     )
+
+
+def _emit(on_stage, stage: str, state: str, **data) -> None:
+    """진행 상황 콜백 헬퍼. on_stage 가 있으면 {stage, state, ...} 이벤트를 넘긴다.
+
+    stage: "similar" | "research" | "outline" | "draft" | "critique"
+           | "rewrite" | "image" | "save"
+    state: "start" | "done"
+    """
+    if on_stage:
+        on_stage({"stage": stage, "state": state, **data})
 
 
 def generate_blog(
     topic: str,
     on_search=None,
+    on_stage=None,
     threshold: float = SIMILARITY_THRESHOLD,
     reuse_existing: bool = True,
+    similar_limit: int = 6,
     tone: str = DEFAULT_TONE,
     seo_keywords=None,
 ) -> dict:
     """유사 글 확인 → (없으면) 리서치 → 아웃라인 → 초안 → 저장.
 
+    on_search: 검색 실행 때마다 호출 (query: str) -> None
+    on_stage:  단계 전환 때마다 호출 (event: dict) -> None
     tone: 초안 톤앤매너 (정보성/캐주얼/리뷰형/전문적)
     seo_keywords: 쉼표 구분 문자열 또는 리스트
 
-    반환 dict 의 "existing" 이 True 면 DB 의 기존 글을 재사용한 것이다.
+    반환 dict 의 "existing" 이 True 면 DB 의 기존 글을 재사용한 것이며,
+    이때 "similar_posts" 에 유사 글 목록이 함께 담긴다.
     "seo_report" 는 {키워드: 본문 등장 횟수}.
     """
     topic = topic.strip()
     keywords = parse_keywords(seo_keywords)
 
     # 0단계: 임베딩 유사도로 기존 글 확인
-    if reuse_existing:
-        found = find_similar_post(topic, threshold=threshold)
-        if found:
-            return {
-                "existing": True,
-                "similarity": found["similarity"],
-                "topic": found["topic"],
-                "final_content": found["final_content"],
-                "tone": None,
-                "seo_keywords": keywords,
-                "seo_report": count_keyword_occurrences(found["final_content"], keywords),
-                # 하위 호환 필드
-                "research": "",
-                "sources": [],
-                "outline": "",
-                "draft": found["final_content"],
-            }
+    _emit(on_stage, "similar", "start")
+    posts = (
+        find_similar_posts(topic, threshold=threshold, limit=similar_limit)
+        if reuse_existing
+        else []
+    )
+    _emit(on_stage, "similar", "done", posts=posts)
 
-    # 1~3단계: 리서치 → 아웃라인 → 초안(톤·SEO 반영)
-    notes, sources = research(topic, on_search=on_search)
+    if posts:
+        top = posts[0]
+        return {
+            "existing": True,
+            "similar_posts": posts,
+            "post_id": top.get("id"),
+            "similarity": top["similarity"],
+            "topic": top["topic"],
+            "tone": top.get("tone"),
+            "seo_keywords": keywords,
+            "seo_report": count_keyword_occurrences(top["final_content"], keywords),
+            "final_content": top["final_content"],
+            "image_url": top.get("image_url"),
+            "search_retried": top.get("search_retried"),
+            "critique_passed": top.get("critique_passed"),
+            "critique_feedback": top.get("critique_feedback"),
+            "was_rewritten": top.get("was_rewritten"),
+            # 하위 호환 필드
+            "research": "",
+            "sources": [],
+            "outline": "",
+            "draft": top["final_content"],
+        }
+
+    # 1단계: 리서치 (결과가 부족하면 새 검색어로 1회 자동 재시도)
+    _emit(on_stage, "research", "start")
+    research_result = research(topic, on_search=on_search)
+    notes = research_result["notes"]
+    sources = research_result["sources"]
+    search_retried = research_result["search_retried"]
+    _emit(
+        on_stage, "research", "done",
+        notes=notes, sources=sources, search_retried=search_retried,
+    )
+
+    # 2단계: 아웃라인
+    _emit(on_stage, "outline", "start")
     outline = make_outline(topic, notes)
-    draft = write_draft(topic, outline, notes, tone=tone, seo_keywords=keywords)
+    _emit(on_stage, "outline", "done", outline=outline)
 
-    # 5단계: SEO 키워드 등장 횟수 리포트
+    # 3단계: 초안(톤·SEO 반영)
+    _emit(on_stage, "draft", "start", tone=tone)
+    draft = write_draft(topic, outline, notes, tone=tone, seo_keywords=keywords)
+    _emit(on_stage, "draft", "done", draft=draft)
+
+    # 4단계: 자체 품질 검토 → 미흡하면 피드백 반영해 1회만 재작성
+    _emit(on_stage, "critique", "start")
+    critique = critique_draft(draft, notes, tone=tone, seo_keywords=keywords)
+    critique_passed = critique["pass"]
+    critique_feedback = critique["feedback"]
+    _emit(
+        on_stage, "critique", "done",
+        passed=critique_passed, feedback=critique_feedback,
+    )
+
+    was_rewritten = False
+    if not critique_passed:
+        _emit(on_stage, "rewrite", "start", feedback=critique_feedback)
+        draft = rewrite_draft(
+            topic, outline, notes, draft, critique_feedback,
+            tone=tone, seo_keywords=keywords,
+        )
+        was_rewritten = True
+        _emit(on_stage, "rewrite", "done")
+
     seo_report = count_keyword_occurrences(draft, keywords)
 
-    # 4/6단계: 임베딩·톤·SEO 키워드와 함께 저장
-    post_id = persist_blog(topic, outline, draft, tone=tone, seo_keywords=keywords)
+    # 5단계: 주제에 어울리는 대표 이미지 검색 (실패해도 진행)
+    _emit(on_stage, "image", "start")
+    image_url = get_topic_image(topic)
+    _emit(on_stage, "image", "done", image_url=image_url)
+
+    # 6단계: 임베딩·톤·SEO·이미지·자체검토 메타와 함께 저장
+    _emit(on_stage, "save", "start")
+    post_id = persist_blog(
+        topic, outline, draft, tone=tone, seo_keywords=keywords, image_url=image_url,
+        critique_passed=critique_passed, critique_feedback=critique_feedback,
+        was_rewritten=was_rewritten, search_retried=search_retried,
+    )
+    _emit(on_stage, "save", "done", post_id=post_id)
 
     return {
         "existing": False,
+        "similar_posts": [],
         "post_id": post_id,
         "similarity": None,
         "topic": topic,
@@ -405,6 +477,11 @@ def generate_blog(
         "outline": outline,
         "draft": draft,
         "final_content": draft,
+        "image_url": image_url,
+        "search_retried": search_retried,
+        "critique_passed": critique_passed,
+        "critique_feedback": critique_feedback,
+        "was_rewritten": was_rewritten,
     }
 
 
@@ -452,3 +529,12 @@ if __name__ == "__main__":
         print("\n=== SEO 키워드 체크 ===")
         for kw, cnt in result["seo_report"].items():
             print(f"- {kw}: {cnt}회")
+
+    if not result["existing"]:
+        print("\n=== 에이전트 자체 판단 ===")
+        print(f"- 검색 재시도: {'예' if result.get('search_retried') else '아니오'}")
+        passed = result.get("critique_passed")
+        print(f"- 자체 검토: {'통과' if passed else '미통과'}")
+        print(f"- 재작성: {'예' if result.get('was_rewritten') else '아니오'}")
+        if result.get("critique_feedback"):
+            print(f"- 피드백: {result['critique_feedback']}")
