@@ -36,6 +36,7 @@ RESULT_KEYS = (
     "research", "sources", "outline", "draft", "post_id",
     "tone", "seo_keywords", "seo_report", "image_url",
     "search_retried", "critique_passed", "critique_feedback", "was_rewritten",
+    "research_grounded", "research_reason",
 )
 
 TONE_OPTIONS = ["정보성", "캐주얼", "리뷰형", "전문적"]
@@ -106,11 +107,24 @@ def _card_image_url(post: dict) -> str:
     return f"https://picsum.photos/seed/{seed}/600/400"
 
 
+def _render_grounding_warning(src: dict) -> None:
+    """리서치 근거가 부족한 결과에 눈에 띄는 경고 배너를 표시한다."""
+    if src.get("research_grounded") is not False:
+        return
+    reason = (src.get("research_reason") or "").strip()
+    st.error(
+        "⚠️ **이 주제는 온라인에서 확인 가능한 구체적 정보가 부족합니다.** "
+        "일반적인 내용 위주로 작성되었으니 **사실 확인이 필요합니다.**"
+        + (f"\n\n> {reason}" if reason else "")
+    )
+
+
 def _render_agent_log(src: dict) -> None:
     """에이전트 자체 판단 로그를 접이식으로 표시한다 (검색 재시도 / 자체 검토 / 재작성)."""
     has_any = any(
         src.get(k) is not None
-        for k in ("search_retried", "critique_passed", "was_rewritten", "critique_feedback")
+        for k in ("search_retried", "critique_passed", "was_rewritten",
+                  "critique_feedback", "research_grounded")
     )
     if not has_any:
         return
@@ -129,7 +143,14 @@ def _render_agent_log(src: dict) -> None:
     else:
         summary = "자체 판단 로그"
 
+    grounded = src.get("research_grounded")
+
     with st.expander(f"🧠 에이전트 판단 로그 — {summary}"):
+        if grounded is not None:
+            gtext = "충분" if grounded else "부족 ⚠️ (사실 확인 필요)"
+            st.markdown(f"- **리서치 근거**: {gtext}")
+            if grounded is False and src.get("research_reason"):
+                st.caption(str(src["research_reason"]))
         st.markdown(f"- **검색 재시도**: {'예 (결과 부족으로 새 키워드 재검색)' if retried else '아니오'}")
         if passed is None:
             st.markdown("- **자체 검토**: 기록 없음")
@@ -248,6 +269,7 @@ _STAGE_LABELS = {
     "similar": ("기존 글 확인 중 (임베딩 유사도 검색)...", "기존 글 확인 완료"),
     "research": ("1/3 · 리서치 중 (웹 검색)...", "1/3 · 리서치 완료"),
     "outline": ("2/3 · 아웃라인 작성 중...", "2/3 · 아웃라인 완료"),
+    "grounding": ("리서치 근거 확인 중...", "리서치 근거 확인 완료"),
     "draft": ("3/3 · 블로그 초안 작성 중...", "3/3 · 초안 완료"),
     "critique": ("자체 검토 중 (사실·구조·톤·SEO)...", "자체 검토 완료"),
     "rewrite": ("재작성 중 (검토 피드백 반영)...", "재작성 완료"),
@@ -279,6 +301,8 @@ def _run_pipeline(topic_text: str, tone: str, seo_raw: str) -> dict:
                 done_label = (
                     "자체 검토 통과" if ev.get("passed") else "자체 검토 미통과 → 재작성"
                 )
+            elif stage == "grounding" and ev.get("grounded") is False:
+                done_label = "리서치 근거 부족 ⚠️"
             widget.update(label=done_label, state="complete", expanded=False)
 
     def on_search(query: str) -> None:
@@ -295,6 +319,12 @@ def _run_pipeline(topic_text: str, tone: str, seo_raw: str) -> dict:
 
 def _stash_result(result: dict) -> None:
     """generate_blog 결과를 결과 표시 섹션이 읽는 session_state 키로 옮긴다."""
+    if result.get("aborted"):
+        st.session_state["mode"] = "aborted"
+        st.session_state["research_grounded"] = result.get("research_grounded")
+        st.session_state["research_reason"] = result.get("research_reason")
+        return
+
     if result["existing"]:
         st.session_state["mode"] = "existing"
         st.session_state["similar_posts"] = result["similar_posts"]
@@ -306,7 +336,7 @@ def _stash_result(result: dict) -> None:
     for key in ("research", "sources", "outline", "draft",
                 "final_content", "post_id", "seo_report", "image_url",
                 "search_retried", "critique_passed", "critique_feedback",
-                "was_rewritten"):
+                "was_rewritten", "research_grounded", "research_reason"):
         st.session_state[key] = result[key]
 
 
@@ -344,9 +374,19 @@ if run and topic.strip():
 mode = st.session_state.get("mode")
 topic_done = st.session_state.get("topic", "blog")
 
-if mode == "existing":
+if mode == "aborted":
+    st.divider()
+    _render_grounding_warning(st.session_state)
+    st.info(
+        "리서치 근거가 부족해 초안 생성을 **중단**했습니다. "
+        "주제를 더 구체적으로 바꾸거나 다른 주제로 시도해 보세요."
+    )
+    st.caption(f"입력한 주제: {topic_done}")
+
+elif mode == "existing":
     posts = st.session_state.get("similar_posts", [])
     st.divider()
+    _render_grounding_warning(posts[0] if posts else {})
     st.warning(
         f"이미 비슷한 글이 {len(posts)}건 있습니다. 새로 생성하지 않고 기존 글을 보여드립니다."
     )
@@ -356,6 +396,7 @@ if mode == "existing":
 
 elif mode == "new":
     st.divider()
+    _render_grounding_warning(st.session_state)
     st.success(
         f"새 글을 생성했습니다. (톤: {st.session_state.get('tone')} · "
         f"blog_posts #{st.session_state.get('post_id')} 저장됨)"

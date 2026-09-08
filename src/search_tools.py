@@ -200,6 +200,54 @@ def _suggest_retry_keywords(client, model, user_prompt, tried_queries) -> str | 
     return keywords or None
 
 
+# 리서치 근거 충분성 판정 지시문
+_GROUNDING_SYSTEM = (
+    "당신은 리서치 결과의 '근거 충분성'을 판정합니다. "
+    "주어진 리서치 노트와 출처 목록을 보고, 이 주제로 블로그 글을 쓸 때 "
+    "검증 가능한 구체적 정보(수치·고유명사·장소·날짜·기관명 등)를 충분히 확보했는지 판단하세요. "
+    "구체 정보가 거의 없이 일반론·추측뿐이면 grounded 는 false 입니다. "
+    'JSON 한 개만 출력하세요: {"grounded": true 또는 false, "reason": "한두 문장 근거"}'
+)
+
+
+def _emit_stage(on_stage, stage: str, state: str, **data) -> None:
+    if on_stage:
+        on_stage({"stage": stage, "state": state, **data})
+
+
+def _assess_grounding(client, model, user_prompt, notes, sources) -> dict:
+    """리서치 노트·출처로 근거 충분성을 판정한다. 실패 시 통과(grounded=True)로 본다.
+
+    반환: {"grounded": bool, "reason": str}
+    """
+    source_lines = "\n".join(
+        f"- {(s.get('title') or '').strip()} {s.get('url') or ''}".strip()
+        for s in sources[:15]
+    ) or "(출처 없음)"
+    ask = (
+        f"[주제/요청]\n{user_prompt}\n\n"
+        f"[리서치 노트]\n{notes or '(내용 없음)'}\n\n"
+        f"[출처 목록]\n{source_lines}"
+    )
+    try:
+        response = client.messages.create(
+            model=model,
+            max_tokens=200,
+            system=_GROUNDING_SYSTEM,
+            messages=[{"role": "user", "content": ask}],
+        )
+    except Exception:  # noqa: BLE001 - 판정 실패 시 경고를 띄우지 않는 쪽으로
+        return {"grounded": True, "reason": "(근거 충분성 판정에 실패해 통과 처리했습니다.)"}
+
+    data = extract_json(last_text(response))
+    if not data or "grounded" not in data:
+        return {"grounded": True, "reason": "(근거 충분성 응답을 해석하지 못해 통과 처리했습니다.)"}
+    return {
+        "grounded": bool(data.get("grounded")),
+        "reason": str(data.get("reason") or "").strip(),
+    }
+
+
 def run_search_loop(
     client,
     user_prompt: str,
@@ -207,18 +255,26 @@ def run_search_loop(
     *,
     max_turns: int = 5,
     on_search=None,
+    on_stage=None,
     query_transform=None,
     model: str = MODEL,
     max_tokens: int = 3000,
     retry_on_thin: bool = False,
     min_results: int = 2,
+    assess_grounding: bool = False,
 ) -> dict:
-    """tool_use 루프를 돌며 {"text", "sources", "search_retried"} 를 반환한다.
+    """tool_use 루프를 돌며 결과 dict 를 반환한다.
+
+    반환 키: {"text", "sources", "search_retried", "research_grounded",
+             "research_reason"}
 
     on_search: 검색 실행 때마다 호출되는 콜백 (query: str) -> None
+    on_stage:  진행 단계 콜백 (event dict) -> None. assess_grounding 시 "grounding" 발행
     query_transform: 모델이 만든 검색어를 실제 검색 전에 가공하는 함수 (str) -> str
     retry_on_thin: True 이고 유효 검색 결과가 min_results 이하이면, Claude 에게
         새 검색어를 물어 1회만 추가 검색한다(무한 재시도 방지).
+    assess_grounding: True 이면 루프 종료 후 Claude 에게 근거 충분성을 한 번 더 물어
+        research_grounded/research_reason 을 채운다.
     """
     messages = [{"role": "user", "content": user_prompt}]
     final_text = ""
@@ -310,4 +366,25 @@ def run_search_loop(
 
     # 신뢰 소스를 출처 목록 상단으로
     sources.sort(key=lambda h: not h.get("trusted"))
-    return {"text": final_text, "sources": sources, "search_retried": search_retried}
+
+    # 근거 충분성 판정 (검증 가능한 구체 정보를 충분히 확보했는가)
+    research_grounded, research_reason = True, ""
+    if assess_grounding:
+        _emit_stage(on_stage, "grounding", "start")
+        grounding = _assess_grounding(
+            client, model, user_prompt, final_text, sources
+        )
+        research_grounded = grounding["grounded"]
+        research_reason = grounding["reason"]
+        _emit_stage(
+            on_stage, "grounding", "done",
+            grounded=research_grounded, reason=research_reason,
+        )
+
+    return {
+        "text": final_text,
+        "sources": sources,
+        "search_retried": search_retried,
+        "research_grounded": research_grounded,
+        "research_reason": research_reason,
+    }
