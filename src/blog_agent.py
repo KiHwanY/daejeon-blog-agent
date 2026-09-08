@@ -278,9 +278,19 @@ def rewrite_draft(
     seo_instruction = ""
     if keywords:
         seo_instruction = (
-            f" 다음 키워드를 제목과 본문에 자연스럽게 각각 3~5회 반영하세요: "
+            f" 다음 키워드를 글 전체에 자연스럽게 각각 3~5회 반영하되, 한 단락이나 "
+            f"한 문장에 몰아넣지 말고 인트로·본문·결론에 고르게 나눠 배치하세요: "
             f"{', '.join(keywords)}."
         )
+
+    anti_repetition = (
+        " [재작성 규칙] 피드백에서 지적된 문제를 고치되, 이전 초안과 동일한 수사법·문장 "
+        "구조를 반복하지 마세요. 특히 SEO 키워드를 본문 주제와 대비·구별짓는 방식"
+        "('~와 달리', '~와는 무관하게', '~와 다른 결' 등)으로 여러 번 반복하지 마세요. "
+        "키워드는 인트로·본문·결론에서 각각 서로 다른 방식으로 녹여내고, 한 구간에서는 "
+        "최대 1~2회만 자연스러운 맥락으로 언급하세요(키워드별 총 등장 횟수 목표는 유지, "
+        "같은 문장 패턴 재사용은 금지)."
+    )
 
     system = (
         "당신은 한국어 블로그 작가입니다. "
@@ -289,6 +299,7 @@ def rewrite_draft(
         "리서치 노트에 없는 사실은 지어내지 말고, 마크다운으로 작성하세요."
         + f" [톤앤매너] {tone_instruction}"
         + seo_instruction
+        + anti_repetition
     )
     prompt = (
         f"주제: {topic}\n\n"
@@ -296,7 +307,8 @@ def rewrite_draft(
         f"리서치 노트:\n{research_notes}\n\n"
         f"이전 초안:\n{previous_draft}\n\n"
         f"검수 피드백(반드시 반영):\n{feedback}\n\n"
-        "위 피드백을 모두 반영해 800~1200자 분량의 완성된 블로그 글을 다시 작성하세요."
+        "위 피드백을 모두 반영하되 이전 초안의 문장 패턴을 그대로 되풀이하지 말고, "
+        "800~1200자 분량의 완성된 블로그 글을 다시 작성하세요."
     )
     response = client.messages.create(
         model=MODEL,
@@ -304,7 +316,50 @@ def rewrite_draft(
         system=system,
         messages=[{"role": "user", "content": prompt}],
     )
-    return last_text(response)
+    # 재작성 응답이 비면(제약 충돌 등) 빈 글 대신 이전 초안을 유지한다.
+    return last_text(response) or previous_draft
+
+
+# 재작성본에서 'SEO 키워드를 본문과 대비/구별짓는' 상투적 구문
+_CONTRAST_MARKERS = (
+    "와 달리", "과 달리", "와는 달리", "과는 달리",
+    "와 무관하게", "과 무관하게", "와는 무관하게", "과는 무관하게",
+    "와 무관한", "과 무관한",
+    "와 다른 결", "과 다른 결",
+    "와 대비", "과 대비", "와 대조", "과 대조",
+    "와는 다른", "과는 다른",
+)
+
+
+def _split_sentences(text: str) -> list[str]:
+    """마침표·물음표·느낌표·줄바꿈 기준으로 대략적인 문장 리스트를 만든다."""
+    return [s.strip() for s in re.split(r"[.!?\n]+", text or "") if s.strip()]
+
+
+def check_contrast_repetition(text: str, seo_keywords, threshold: int = 3) -> dict:
+    """규칙 기반(무 LLM) 반복 패턴 점검.
+
+    '대비 표현'(_CONTRAST_MARKERS)과 SEO 키워드가 같은 문장에 함께 등장하는
+    빈도를 센다. threshold 회 이상이면 repetitive=True.
+
+    반환: {"count": int, "repetitive": bool, "examples": list[str]}
+    """
+    keywords = parse_keywords(seo_keywords)
+    if not keywords:
+        return {"count": 0, "repetitive": False, "examples": []}
+
+    hits = []
+    for sentence in _split_sentences(text):
+        has_contrast = any(marker in sentence for marker in _CONTRAST_MARKERS)
+        has_keyword = any(kw in sentence for kw in keywords)
+        if has_contrast and has_keyword:
+            hits.append(sentence)
+
+    return {
+        "count": len(hits),
+        "repetitive": len(hits) >= threshold,
+        "examples": hits[:3],
+    }
 
 
 def persist_blog(
@@ -445,7 +500,21 @@ def generate_blog(
             tone=tone, seo_keywords=keywords,
         )
         was_rewritten = True
-        _emit(on_stage, "rewrite", "done")
+
+        # 가벼운 안전장치: 재작성본에 '대비 표현 + SEO 키워드' 상투구가 여전히
+        # 반복되는지 규칙 기반으로만 점검한다(2차 LLM 재작성 없이 기록만).
+        repetition = check_contrast_repetition(draft, keywords)
+        if repetition["repetitive"]:
+            critique_feedback = (
+                (critique_feedback or "").rstrip()
+                + f" ⚠️[자동 점검] 재작성 후에도 '대비 표현 + SEO 키워드' 상투 구문이 "
+                f"{repetition['count']}회 반복 감지되어 수사 패턴이 단조로울 수 있습니다."
+            )
+        _emit(
+            on_stage, "rewrite", "done",
+            repetition_count=repetition["count"],
+            repetition_warning=repetition["repetitive"],
+        )
 
     seo_report = count_keyword_occurrences(draft, keywords)
 

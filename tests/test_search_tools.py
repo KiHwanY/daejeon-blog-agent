@@ -274,3 +274,33 @@ def test_no_retry_when_suggestion_has_no_keywords(monkeypatch):
     client = _FakeClient(script)
     res = stt.run_search_loop(client, "q", "sys", retry_on_thin=True)
     assert res["search_retried"] is False
+
+
+def test_synthesizes_when_loop_ends_without_final_text(monkeypatch):
+    """도구만 호출하다 max_turns 에 걸려 최종 텍스트가 없으면 정리 1회를 더 요청한다."""
+    monkeypatch.setattr(stt, "web_search", lambda q, **k: [_hit("https://a/1")])
+    tool_resp = _Resp(
+        [_Block(type="tool_use", name="web_search", id="x", input={"query": "q"})],
+        stop_reason="tool_use",
+    )
+    synth = _Resp([_Block(type="text", text="지금까지 찾은 내용 정리")])
+    client = _FakeClient([tool_resp, tool_resp, synth])
+
+    res = stt.run_search_loop(client, "q", "sys", max_turns=2)
+
+    assert res["text"] == "지금까지 찾은 내용 정리"
+    assert len(client.messages.calls) == 3          # 루프 2회 + 정리 1회
+    assert "tools" not in client.messages.calls[-1]  # 정리 호출은 도구 없이
+
+
+def test_no_synthesis_call_when_no_sources(monkeypatch):
+    """결과가 하나도 없으면 정리 호출도 하지 않는다."""
+    monkeypatch.setattr(stt, "web_search", lambda q, **k: [])
+    tool_resp = _Resp(
+        [_Block(type="tool_use", name="web_search", id="x", input={"query": "q"})],
+        stop_reason="tool_use",
+    )
+    client = _FakeClient([tool_resp, tool_resp])
+    res = stt.run_search_loop(client, "q", "sys", max_turns=2)
+    assert res["text"] == ""
+    assert len(client.messages.calls) == 2

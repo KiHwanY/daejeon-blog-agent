@@ -137,8 +137,11 @@ def _render_agent_log(src: dict) -> None:
             st.markdown(f"- **자체 검토 결과**: {'통과(pass)' if passed else '미통과(fail)'}")
         st.markdown(f"- **재작성 여부**: {'예 (피드백 반영해 1회 재작성)' if rewritten else '아니오'}")
         if feedback:
+            main_fb, _, auto_note = feedback.partition("⚠️[자동 점검]")
             st.markdown("- **검토 피드백**:")
-            st.info(feedback)
+            st.info(main_fb.strip())
+            if auto_note.strip():
+                st.warning("⚠️ 자동 점검: " + auto_note.strip())
 
 
 def _render_post_cards(posts: list[dict]) -> None:

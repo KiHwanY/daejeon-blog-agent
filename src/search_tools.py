@@ -283,6 +283,31 @@ def run_search_loop(
             search_retried = True
             _do_search(new_keywords)
 
+    # 루프가 최종 정리 없이 도구 호출만 하다 끝났으면(max_turns 도달) 정리 1회 요청
+    if (
+        not final_text
+        and sources
+        and messages
+        and messages[-1]["role"] == "user"
+        and isinstance(messages[-1]["content"], list)
+    ):
+        messages[-1]["content"].append(
+            {
+                "type": "text",
+                "text": "추가 검색은 하지 말고, 지금까지 찾은 내용만으로 최종 정리를 작성하세요.",
+            }
+        )
+        try:
+            wrap = client.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                system=system_prompt,
+                messages=messages,
+            )
+            final_text = last_text(wrap) or final_text
+        except Exception:  # noqa: BLE001 - 정리 실패해도 지금까지 결과로 진행
+            pass
+
     # 신뢰 소스를 출처 목록 상단으로
     sources.sort(key=lambda h: not h.get("trusted"))
     return {"text": final_text, "sources": sources, "search_retried": search_retried}
