@@ -32,8 +32,8 @@ st.caption(
 
 # 이전 실행 결과를 담는 세션 키
 RESULT_KEYS = (
-    "topic", "mode", "cards", "grounding_src", "similar_posts", "final_content",
-    "research", "sources", "outline", "draft", "post_id",
+    "topic", "mode", "cards", "grounding_src", "open_card", "similar_posts",
+    "final_content", "research", "sources", "outline", "draft", "post_id",
     "tone", "seo_keywords", "seo_report", "image_url",
     "search_retried", "critique_passed", "critique_feedback", "was_rewritten",
     "research_grounded", "research_reason",
@@ -41,18 +41,19 @@ RESULT_KEYS = (
 
 TONE_OPTIONS = ["정보성", "캐주얼", "리뷰형", "전문적"]
 
-# 카드 그리드 + 전체폭 레이아웃 + 카드 전체를 클릭 영역으로 만드는 투명 버튼 오버레이
+# 카드 그리드 + 전체폭 레이아웃
 CARD_CSS = """
 <style>
 /* 본문을 화면에 꽉 차게 */
 .block-container { padding: 1.4rem 3rem 4rem; max-width: 100%; }
 
-/* 카드 */
+/* 카드 (이미지 + 본문) */
 .post-card {
   border: 1px solid rgba(128,128,128,.28);
-  border-radius: 16px;
+  border-radius: 16px 16px 0 0;
+  border-bottom: 0;
   overflow: hidden;
-  height: 340px;
+  height: 300px;
   display: flex;
   flex-direction: column;
   transition: box-shadow .15s ease, transform .15s ease;
@@ -88,30 +89,26 @@ CARD_CSS = """
 .post-card-sub { opacity: .55; }
 .post-card-score { font-weight: 700; color: #f5a623; white-space: nowrap; }
 
-/* 카드 컨테이너(st.container key='pc-...') 위에 투명 버튼을 겹쳐 전체를 클릭 영역으로 */
+/* 카드 컨테이너: 마크다운 카드와 '상세 보기' 버튼을 한 덩어리로 */
 [class*="st-key-pc-"] { position: relative; }
-[class*="st-key-pc-"] > div { gap: 0 !important; }
-[class*="st-key-pc-"] .stButton {
-  position: absolute; inset: 0; margin: 0; z-index: 5;
-}
-[class*="st-key-pc-"] .stButton > button {
-  width: 100%; height: 100%;
-  background: transparent !important; border: 0 !important;
-  box-shadow: none !important; color: transparent !important; cursor: pointer;
-}
-[class*="st-key-pc-"] .stButton > button:hover,
-[class*="st-key-pc-"] .stButton > button:focus,
-[class*="st-key-pc-"] .stButton > button:active {
-  background: transparent !important; border: 0 !important;
-  box-shadow: none !important; outline: none !important;
+[class*="st-key-pc-"] [data-testid="stVerticalBlock"] { gap: 0 !important; }
+[class*="st-key-pc-"] .stButton > button,
+[class*="st-key-pc-"] button[data-testid^="stBaseButton"] {
+  width: 100%;
+  border: 1px solid rgba(128,128,128,.28) !important;
+  border-radius: 0 0 16px 16px !important;
+  margin-top: -1px;
+  font-weight: 600;
 }
 [class*="st-key-pc-"]:hover .post-card {
-  box-shadow: 0 8px 28px rgba(0,0,0,.16);
-  transform: translateY(-3px);
+  box-shadow: 0 8px 28px rgba(0,0,0,.14);
 }
+[class*="st-key-pc-"]:hover .post-card { transform: translateY(-2px); }
 
-/* 모달 뒤 배경: 어둡게 + 살짝 블러 (best-effort) */
-div[data-baseweb="modal"] > div:first-child {
+/* 모달 뒤 배경: 어둡게 + 살짝 블러 (best-effort — 안 먹어도 기본 딤은 적용됨) */
+div[data-baseweb="modal"] > div:first-child,
+div[data-testid="stDialog"] ~ div,
+.stDialog + div {
   background-color: rgba(0,0,0,.55) !important;
   backdrop-filter: blur(2px);
 }
@@ -217,9 +214,18 @@ def _card_key(item: dict) -> str:
     return str(item.get("id") or item.get("post_id") or "new")
 
 
-@st.dialog("상세 보기", width="large")
+def _close_modal() -> None:
+    """모달 상태 해제 (X·바깥클릭·ESC 로 dismiss 시 on_dismiss 로도 호출됨)."""
+    st.session_state.pop("open_card", None)
+
+
+@st.dialog("상세 보기", width="large", on_dismiss=_close_modal)
 def _detail_dialog(item: dict) -> None:
-    """카드 클릭 시 열리는 모달. 스크롤·닫기·외부클릭 닫기·배경 딤은 st.dialog 기본 제공."""
+    """카드 '상세 보기' 클릭 시 열리는 모달.
+
+    스크롤·X·바깥클릭·ESC 로 닫기, 배경 딤은 st.dialog 기본 제공.
+    바깥클릭/ESC 시 on_dismiss=_close_modal 이 open_card 상태를 지워 재렌더를 막는다.
+    """
     topic = item.get("topic") or "블로그 글"
 
     st.image(_card_image_url(item), use_container_width=True)
@@ -275,11 +281,12 @@ def _detail_dialog(item: dict) -> None:
         key=f"dl-{_card_key(item)}",
     )
     if c2.button("닫기", use_container_width=True, key="modal-close"):
+        _close_modal()
         st.rerun()
 
 
 def _one_card(item: dict) -> None:
-    """카드 한 장 — 이미지(상단) + 제목/발췌/메타(하단). 컨테이너 전체가 클릭 영역."""
+    """카드 한 장 — 이미지(상단) + 제목/발췌/메타(하단) + '상세 보기' 버튼."""
     is_new = item.get("_kind") == "new"
     if is_new:
         sub = " · ".join(x for x in ["방금 생성", item.get("tone")] if x)
@@ -307,12 +314,15 @@ def _one_card(item: dict) -> None:
 """
     with st.container(key=f"pc-{_card_key(item)}"):
         st.markdown(card, unsafe_allow_html=True)
-        if st.button("자세히 보기", key=f"open-{_card_key(item)}", use_container_width=True):
-            _detail_dialog(item)
+        if st.button(
+            "🔎 상세 보기", key=f"open-{_card_key(item)}", use_container_width=True
+        ):
+            st.session_state["open_card"] = item
+            st.rerun()
 
 
 def _render_result_cards(items: list[dict]) -> None:
-    """결과(생성된 새 글 · 유사 글)를 카드 그리드로 표시."""
+    """결과(생성된 새 글 · 유사 글)를 카드 그리드로 표시하고, 열린 모달을 렌더."""
     if not items:
         return
     st.markdown(CARD_CSS, unsafe_allow_html=True)
@@ -322,6 +332,9 @@ def _render_result_cards(items: list[dict]) -> None:
         for col, item in zip(cols, items[i:i + per_row]):
             with col:
                 _one_card(item)
+
+    if st.session_state.get("open_card") is not None:
+        _detail_dialog(st.session_state["open_card"])
 
 
 def _friendly_error(e: Exception) -> str:
