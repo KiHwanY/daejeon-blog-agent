@@ -58,6 +58,15 @@ REGION_GUIDELINE = (
     "주제에 다른 지역명이 명시된 경우에는 그 지역을 우선한다."
 )
 
+# 리서치 근거가 부족할 때 초안/재작성 프롬프트에 덧붙이는 강한 제약
+_LOW_GROUNDING_INSTRUCTION = (
+    " [근거 부족] 이 주제는 온라인에서 확인 가능한 구체적 정보가 부족합니다. "
+    "일반론·원론적 설명 위주로만 서술하고, 리서치 노트에 명시되지 않은 구체적 사실"
+    "(수치·개점일·주소·가격·상호·인물명 등)은 절대 지어내지 마세요. "
+    "불확실한 부분은 '~로 알려져 있습니다', '방문 전 확인이 필요합니다'처럼 완곡하게 표현하세요."
+)
+
+
 @lru_cache(maxsize=None)
 def _keyword_list(list_name: str) -> tuple[str, ...]:
     """keyword_lists 테이블의 목록을 프로세스 1회만 조회해 캐시한다.
@@ -109,11 +118,13 @@ def count_keyword_occurrences(text, seo_keywords) -> dict:
 # 3단계 파이프라인
 # --------------------------------------------------------------------------
 
-def research(topic: str, on_search=None) -> dict:
+def research(topic: str, on_search=None, on_stage=None) -> dict:
     """1단계: 주제에 대한 리서치.
 
-    반환: {"notes": str, "sources": list[dict], "search_retried": bool}
-    유효 검색 결과가 2개 이하이면 새 검색어로 1회 자동 재시도한다.
+    반환: {"notes", "sources", "search_retried", "research_grounded",
+          "research_reason"}
+    - 유효 검색 결과가 2개 이하이면 새 검색어로 1회 자동 재시도한다.
+    - 루프 종료 후 근거 충분성(검증 가능한 구체 정보 확보 여부)을 1회 판정한다.
     """
     system = (
         "당신은 블로그 글감을 조사하는 리서치 에이전트입니다. "
@@ -131,13 +142,17 @@ def research(topic: str, on_search=None) -> dict:
         prompt,
         system,
         on_search=on_search,
+        on_stage=on_stage,
         query_transform=localize_query,
         retry_on_thin=True,
+        assess_grounding=True,
     )
     return {
         "notes": result["text"],
         "sources": result["sources"],
         "search_retried": result["search_retried"],
+        "research_grounded": result["research_grounded"],
+        "research_reason": result["research_reason"],
     }
 
 
@@ -165,11 +180,13 @@ def write_draft(
     research_notes: str,
     tone: str = DEFAULT_TONE,
     seo_keywords=None,
+    low_grounding: bool = False,
 ) -> str:
     """3단계: 아웃라인 + 리서치를 바탕으로 블로그 초안(마크다운) 작성
 
     tone: TONE_INSTRUCTIONS 의 키 중 하나 (정보성/캐주얼/리뷰형/전문적)
     seo_keywords: 쉼표 구분 문자열 또는 리스트. 있으면 제목·본문에 3~5회 반영 지시.
+    low_grounding: True 이면 '구체 사실을 지어내지 말고 일반론 위주로' 강한 제약을 추가.
     """
     tone_instruction = TONE_INSTRUCTIONS.get(tone, TONE_INSTRUCTIONS[DEFAULT_TONE])
 
@@ -188,6 +205,7 @@ def write_draft(
         "본문에서 참고한 내용은 자연스럽게 링크로 출처를 표기하세요."
         + f" [톤앤매너] {tone_instruction}"
         + seo_instruction
+        + (_LOW_GROUNDING_INSTRUCTION if low_grounding else "")
     )
     prompt = (
         f"주제: {topic}\n\n"
@@ -264,6 +282,7 @@ def rewrite_draft(
     feedback: str,
     tone: str = DEFAULT_TONE,
     seo_keywords=None,
+    low_grounding: bool = False,
 ) -> str:
     """자체 검토 피드백을 반영해 초안을 1회 재작성한다."""
     tone_instruction = TONE_INSTRUCTIONS.get(tone, TONE_INSTRUCTIONS[DEFAULT_TONE])
@@ -293,6 +312,7 @@ def rewrite_draft(
         + f" [톤앤매너] {tone_instruction}"
         + seo_instruction
         + anti_repetition
+        + (_LOW_GROUNDING_INSTRUCTION if low_grounding else "")
     )
     prompt = (
         f"주제: {topic}\n\n"
@@ -357,6 +377,8 @@ def persist_blog(
     critique_feedback: str | None = None,
     was_rewritten: bool = False,
     search_retried: bool = False,
+    research_grounded: bool | None = None,
+    research_reason: str | None = None,
 ) -> int:
     """완성된 글을 임베딩·톤·SEO·이미지·자체검토 메타와 함께 blog_posts 에 저장하고 id 반환."""
     final_content = draft if final_content is None else final_content
@@ -373,14 +395,16 @@ def persist_blog(
         critique_feedback=critique_feedback,
         was_rewritten=was_rewritten,
         search_retried=search_retried,
+        research_grounded=research_grounded,
+        research_reason=research_reason,
     )
 
 
 def _emit(on_stage, stage: str, state: str, **data) -> None:
     """진행 상황 콜백 헬퍼. on_stage 가 있으면 {stage, state, ...} 이벤트를 넘긴다.
 
-    stage: "similar" | "research" | "outline" | "draft" | "critique"
-           | "rewrite" | "image" | "save"
+    stage: "similar" | "research" | "grounding" | "outline" | "draft"
+           | "critique" | "rewrite" | "image" | "save"
     state: "start" | "done"
     """
     if on_stage:
@@ -396,13 +420,18 @@ def generate_blog(
     similar_limit: int = 6,
     tone: str = DEFAULT_TONE,
     seo_keywords=None,
+    abort_on_weak_research: bool = False,
 ) -> dict:
-    """유사 글 확인 → (없으면) 리서치 → 아웃라인 → 초안 → 저장.
+    """유사 글 확인 → (없으면) 리서치 → 근거 확인 → 아웃라인 → 초안 → 자체 검토 → 저장.
 
     on_search: 검색 실행 때마다 호출 (query: str) -> None
     on_stage:  단계 전환 때마다 호출 (event: dict) -> None
     tone: 초안 톤앤매너 (정보성/캐주얼/리뷰형/전문적)
     seo_keywords: 쉼표 구분 문자열 또는 리스트
+    abort_on_weak_research:
+        - False(기본, 옵션 B): 근거가 부족해도 "일반론 위주·사실 지어내기 금지" 제약을
+          걸고 초안을 생성하되, 결과에 research_grounded=False 경고를 담는다.
+        - True(옵션 A): 근거가 부족하면 초안을 만들지 않고 "aborted": True 로 즉시 반환.
 
     반환 dict 의 "existing" 이 True 면 DB 의 기존 글을 재사용한 것이며,
     이때 "similar_posts" 에 유사 글 목록이 함께 담긴다.
@@ -424,6 +453,7 @@ def generate_blog(
         top = posts[0]
         return {
             "existing": True,
+            "aborted": False,
             "similar_posts": posts,
             "post_id": top.get("id"),
             "similarity": top["similarity"],
@@ -437,6 +467,8 @@ def generate_blog(
             "critique_passed": top.get("critique_passed"),
             "critique_feedback": top.get("critique_feedback"),
             "was_rewritten": top.get("was_rewritten"),
+            "research_grounded": top.get("research_grounded"),
+            "research_reason": top.get("research_reason"),
             # 하위 호환 필드
             "research": "",
             "sources": [],
@@ -444,25 +476,58 @@ def generate_blog(
             "draft": top["final_content"],
         }
 
-    # 1단계: 리서치 (결과가 부족하면 새 검색어로 1회 자동 재시도)
+    # 1단계: 리서치 (결과 부족 시 재검색 + 근거 충분성 판정)
     _emit(on_stage, "research", "start")
-    research_result = research(topic, on_search=on_search)
+    research_result = research(topic, on_search=on_search, on_stage=on_stage)
     notes = research_result["notes"]
     sources = research_result["sources"]
     search_retried = research_result["search_retried"]
+    research_grounded = research_result["research_grounded"]
+    research_reason = research_result["research_reason"]
     _emit(
         on_stage, "research", "done",
         notes=notes, sources=sources, search_retried=search_retried,
     )
+
+    low_grounding = not research_grounded
+
+    # 근거가 부족한데 옵션 A(중단)면 초안을 만들지 않고 즉시 반환
+    if low_grounding and abort_on_weak_research:
+        return {
+            "existing": False,
+            "aborted": True,
+            "similar_posts": [],
+            "post_id": None,
+            "similarity": None,
+            "topic": topic,
+            "tone": tone,
+            "seo_keywords": keywords,
+            "seo_report": {},
+            "research": notes,
+            "sources": sources,
+            "outline": "",
+            "draft": "",
+            "final_content": "",
+            "image_url": None,
+            "search_retried": search_retried,
+            "critique_passed": None,
+            "critique_feedback": None,
+            "was_rewritten": False,
+            "research_grounded": False,
+            "research_reason": research_reason,
+        }
 
     # 2단계: 아웃라인
     _emit(on_stage, "outline", "start")
     outline = make_outline(topic, notes)
     _emit(on_stage, "outline", "done", outline=outline)
 
-    # 3단계: 초안(톤·SEO 반영)
-    _emit(on_stage, "draft", "start", tone=tone)
-    draft = write_draft(topic, outline, notes, tone=tone, seo_keywords=keywords)
+    # 3단계: 초안(톤·SEO 반영, 근거 부족 시 강한 제약)
+    _emit(on_stage, "draft", "start", tone=tone, low_grounding=low_grounding)
+    draft = write_draft(
+        topic, outline, notes, tone=tone, seo_keywords=keywords,
+        low_grounding=low_grounding,
+    )
     _emit(on_stage, "draft", "done", draft=draft)
 
     # 4단계: 자체 품질 검토 → 미흡하면 피드백 반영해 1회만 재작성
@@ -480,7 +545,7 @@ def generate_blog(
         _emit(on_stage, "rewrite", "start", feedback=critique_feedback)
         draft = rewrite_draft(
             topic, outline, notes, draft, critique_feedback,
-            tone=tone, seo_keywords=keywords,
+            tone=tone, seo_keywords=keywords, low_grounding=low_grounding,
         )
         was_rewritten = True
 
@@ -506,17 +571,19 @@ def generate_blog(
     image_url = get_topic_image(topic)
     _emit(on_stage, "image", "done", image_url=image_url)
 
-    # 6단계: 임베딩·톤·SEO·이미지·자체검토 메타와 함께 저장
+    # 6단계: 임베딩·톤·SEO·이미지·자체검토·근거 메타와 함께 저장
     _emit(on_stage, "save", "start")
     post_id = persist_blog(
         topic, outline, draft, tone=tone, seo_keywords=keywords, image_url=image_url,
         critique_passed=critique_passed, critique_feedback=critique_feedback,
         was_rewritten=was_rewritten, search_retried=search_retried,
+        research_grounded=research_grounded, research_reason=research_reason,
     )
     _emit(on_stage, "save", "done", post_id=post_id)
 
     return {
         "existing": False,
+        "aborted": False,
         "similar_posts": [],
         "post_id": post_id,
         "similarity": None,
@@ -534,6 +601,8 @@ def generate_blog(
         "critique_passed": critique_passed,
         "critique_feedback": critique_feedback,
         "was_rewritten": was_rewritten,
+        "research_grounded": research_grounded,
+        "research_reason": research_reason,
     }
 
 
@@ -560,6 +629,12 @@ if __name__ == "__main__":
 
     result = generate_blog(topic, tone=tone, seo_keywords=seo)
 
+    if result.get("aborted"):
+        print("\n=== 생성 중단 ===")
+        print("리서치 근거가 부족해 초안 생성을 중단했습니다.")
+        print(f"사유: {result.get('research_reason')}")
+        raise SystemExit(0)
+
     if result["existing"]:
         print(f"\n이미 비슷한 글이 있습니다 (유사도: {result['similarity']:.2f})")
         print(f"기존 글 주제: {result['topic']}")
@@ -584,6 +659,10 @@ if __name__ == "__main__":
 
     if not result["existing"]:
         print("\n=== 에이전트 자체 판단 ===")
+        grounded = result.get("research_grounded")
+        print(f"- 리서치 근거: {'충분' if grounded else '부족 ⚠️'}")
+        if result.get("research_reason"):
+            print(f"  · {result['research_reason']}")
         print(f"- 검색 재시도: {'예' if result.get('search_retried') else '아니오'}")
         passed = result.get("critique_passed")
         print(f"- 자체 검토: {'통과' if passed else '미통과'}")
