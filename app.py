@@ -21,19 +21,19 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src
 
 import blog_agent  # noqa: E402  (경로 추가 후 import)
 
-st.set_page_config(page_title="대전 블로그 생성기", page_icon="📝")
+st.set_page_config(page_title="대전 블로그 생성기", page_icon="📝", layout="wide")
 
 st.title("📝 대전 지역 블로그 생성기")
 st.caption(
     "리서치 → 아웃라인 → 초안 순으로 블로그 글을 만들어 줍니다. "
     "지역 정보가 필요한 주제는 자동으로 **대전**을 맥락으로 삼고, "
-    "이미 비슷한 글이 있으면 카드로 보여 줍니다."
+    "결과는 카드로 보여 줍니다. 카드를 클릭하면 상세 내용이 모달로 열립니다."
 )
 
 # 이전 실행 결과를 담는 세션 키
 RESULT_KEYS = (
-    "topic", "mode", "similar_posts", "final_content",
-    "research", "sources", "outline", "draft", "post_id",
+    "topic", "mode", "cards", "grounding_src", "open_card", "similar_posts",
+    "final_content", "research", "sources", "outline", "draft", "post_id",
     "tone", "seo_keywords", "seo_report", "image_url",
     "search_retried", "critique_passed", "critique_feedback", "was_rewritten",
     "research_grounded", "research_reason",
@@ -41,46 +41,76 @@ RESULT_KEYS = (
 
 TONE_OPTIONS = ["정보성", "캐주얼", "리뷰형", "전문적"]
 
-# 카드 UI 스타일 — 상단 70% 이미지 / 하단 30% 내용
+# 카드 그리드 + 전체폭 레이아웃
 CARD_CSS = """
 <style>
+/* 본문을 화면에 꽉 차게 */
+.block-container { padding: 1.4rem 3rem 4rem; max-width: 100%; }
+
+/* 카드 (이미지 + 본문) */
 .post-card {
-  border: 1px solid rgba(128,128,128,.35);
-  border-radius: 14px;
+  border: 1px solid rgba(128,128,128,.28);
+  border-radius: 16px 16px 0 0;
+  border-bottom: 0;
   overflow: hidden;
-  height: 360px;
+  height: 300px;
   display: flex;
   flex-direction: column;
-  margin-bottom: 10px;
+  transition: box-shadow .15s ease, transform .15s ease;
 }
 .post-card-img {
-  flex: 0 0 70%;
+  flex: 0 0 64%;
   background-size: cover;
   background-position: center;
   background-color: rgba(128,128,128,.15);
 }
 .post-card-body {
-  flex: 0 0 30%;
-  padding: 10px 12px;
+  flex: 1;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
   overflow: hidden;
 }
 .post-card-title {
-  font-weight: 700;
-  font-size: .92rem;
-  margin-bottom: 3px;
-  white-space: nowrap;
+  font-weight: 700; font-size: 1rem; line-height: 1.3;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
   overflow: hidden;
-  text-overflow: ellipsis;
 }
-.post-card-meta { font-size: .72rem; opacity: .6; margin-bottom: 5px; }
 .post-card-text {
-  font-size: .78rem;
-  line-height: 1.35;
-  opacity: .85;
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
+  font-size: .8rem; line-height: 1.4; opacity: .72; flex: 1;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
   overflow: hidden;
+}
+.post-card-foot {
+  display: flex; justify-content: space-between; align-items: center;
+  font-size: .78rem;
+}
+.post-card-sub { opacity: .55; }
+.post-card-score { font-weight: 700; color: #f5a623; white-space: nowrap; }
+
+/* 카드 컨테이너: 마크다운 카드와 '상세 보기' 버튼을 한 덩어리로 */
+[class*="st-key-pc-"] { position: relative; }
+[class*="st-key-pc-"] [data-testid="stVerticalBlock"] { gap: 0 !important; }
+[class*="st-key-pc-"] .stButton > button,
+[class*="st-key-pc-"] button[data-testid^="stBaseButton"] {
+  width: 100%;
+  border: 1px solid rgba(128,128,128,.28) !important;
+  border-radius: 0 0 16px 16px !important;
+  margin-top: -1px;
+  font-weight: 600;
+}
+[class*="st-key-pc-"]:hover .post-card {
+  box-shadow: 0 8px 28px rgba(0,0,0,.14);
+}
+[class*="st-key-pc-"]:hover .post-card { transform: translateY(-2px); }
+
+/* 모달 뒤 배경: 어둡게 + 살짝 블러 (best-effort — 안 먹어도 기본 딤은 적용됨) */
+div[data-baseweb="modal"] > div:first-child,
+div[data-testid="stDialog"] ~ div,
+.stDialog + div {
+  background-color: rgba(0,0,0,.55) !important;
+  backdrop-filter: blur(2px);
 }
 </style>
 """
@@ -168,57 +198,143 @@ def _render_agent_log(src: dict) -> None:
                 st.warning("⚠️ 자동 점검: " + auto_note.strip())
 
 
-def _render_post_cards(posts: list[dict]) -> None:
-    """유사 글을 카드 그리드로 표시 (상단 70% 이미지 / 하단 30% 내용)."""
-    if not posts:
-        return
-    st.markdown(CARD_CSS, unsafe_allow_html=True)
-
-    per_row = 3
-    for i in range(0, len(posts), per_row):
-        row = posts[i:i + per_row]
-        cols = st.columns(per_row)
-        for col, post in zip(cols, row):
-            with col:
-                meta_bits = [f"유사도 {post['similarity']:.2f}"]
-                if post.get("tone"):
-                    meta_bits.append(post["tone"])
-                if post.get("created_at"):
-                    meta_bits.append(str(post["created_at"])[:10])
-                card = f"""
-<div class="post-card">
-  <div class="post-card-img" style="background-image:url('{_card_image_url(post)}')"></div>
-  <div class="post-card-body">
-    <div class="post-card-title">{html_lib.escape(post.get('topic') or '')}</div>
-    <div class="post-card-meta">{html_lib.escape(' · '.join(meta_bits))}</div>
-    <div class="post-card-text">{html_lib.escape(_plain_excerpt(post.get('final_content') or ''))}</div>
-  </div>
-</div>
-"""
-                st.markdown(card, unsafe_allow_html=True)
-                with st.expander("전체 글 보기"):
-                    st.markdown(post.get("final_content") or "")
-                    st.download_button(
-                        "📥 .md 다운로드",
-                        data=post.get("final_content") or "",
-                        file_name=f"{blog_agent.slugify(post.get('topic') or 'blog')}.md",
-                        mime="text/markdown",
-                        key=f"dl_{post.get('id')}",
-                    )
-                _render_agent_log(post)
-
-
-def _render_seo_check() -> None:
-    """SEO 키워드 체크 섹션."""
-    report = st.session_state.get("seo_report") or {}
+def _render_seo_report(report: dict | None) -> None:
+    """SEO 키워드 등장 횟수를 metric 으로 표시."""
+    report = report or {}
     if not report:
         return
-    st.subheader("SEO 키워드 체크")
-    st.caption("입력한 키워드가 본문에 등장한 횟수 (권장: 각 3~5회)")
+    st.markdown("**SEO 키워드 체크** — 본문 등장 횟수 (권장: 각 3~5회)")
     cols = st.columns(len(report))
     for col, (kw, cnt) in zip(cols, report.items()):
         delta = "적정" if 3 <= cnt <= 5 else ("부족" if cnt < 3 else "과다")
         col.metric(kw, f"{cnt}회", delta, delta_color="off")
+
+
+def _card_key(item: dict) -> str:
+    return str(item.get("id") or item.get("post_id") or "new")
+
+
+def _close_modal() -> None:
+    """모달 상태 해제 (X·바깥클릭·ESC 로 dismiss 시 on_dismiss 로도 호출됨)."""
+    st.session_state.pop("open_card", None)
+
+
+@st.dialog("상세 보기", width="large", on_dismiss=_close_modal)
+def _detail_dialog(item: dict) -> None:
+    """카드 '상세 보기' 클릭 시 열리는 모달.
+
+    스크롤·X·바깥클릭·ESC 로 닫기, 배경 딤은 st.dialog 기본 제공.
+    바깥클릭/ESC 시 on_dismiss=_close_modal 이 open_card 상태를 지워 재렌더를 막는다.
+    """
+    topic = item.get("topic") or "블로그 글"
+
+    st.image(_card_image_url(item), use_container_width=True)
+    st.subheader(topic)
+
+    bits = []
+    if item.get("tone"):
+        bits.append(item["tone"])
+    if item.get("similarity") is not None:
+        bits.append(f"유사도 {item['similarity']:.2f}")
+    if item.get("created_at"):
+        bits.append(str(item["created_at"])[:10])
+    if bits:
+        st.caption(" · ".join(bits))
+
+    _render_grounding_warning(item)
+    _render_agent_log(item)
+
+    st.divider()
+    if item.get("_kind") == "new":
+        st.markdown("#### 1. 리서치 결과")
+        st.markdown(item.get("research") or "_(내용 없음)_")
+
+        srcs = item.get("sources") or []
+        if srcs:
+            st.markdown("**검색된 출처** (✅ = 대전 신뢰 소스)")
+            for s in srcs:
+                if s.get("url"):
+                    label = s.get("title") or s["url"]
+                    badge = f" ✅ {s['source_name']}" if s.get("trusted") else ""
+                    st.markdown(f"- [{label}]({s['url']}){badge}")
+
+        st.markdown("#### 2. 아웃라인")
+        st.markdown(item.get("outline") or "_(내용 없음)_")
+
+        st.markdown("#### 3. 블로그 초안")
+        st.markdown(item.get("draft") or "")
+
+        _render_seo_report(item.get("seo_report"))
+        dl_data = item.get("draft") or ""
+    else:
+        st.markdown(item.get("final_content") or "")
+        dl_data = item.get("final_content") or ""
+
+    st.divider()
+    c1, c2 = st.columns(2)
+    c1.download_button(
+        "📥 .md 다운로드",
+        data=dl_data,
+        file_name=f"{blog_agent.slugify(topic)}.md",
+        mime="text/markdown",
+        use_container_width=True,
+        key=f"dl-{_card_key(item)}",
+    )
+    if c2.button("닫기", use_container_width=True, key="modal-close"):
+        _close_modal()
+        st.rerun()
+
+
+def _one_card(item: dict) -> None:
+    """카드 한 장 — 이미지(상단) + 제목/발췌/메타(하단) + '상세 보기' 버튼."""
+    is_new = item.get("_kind") == "new"
+    if is_new:
+        sub = " · ".join(x for x in ["방금 생성", item.get("tone")] if x)
+        score = "🆕"
+    else:
+        sub = " · ".join(
+            b for b in [item.get("tone"), str(item.get("created_at") or "")[:10]] if b
+        )
+        sim = item.get("similarity")
+        score = f"⭐ {sim:.2f}" if sim is not None else ""
+
+    excerpt = _plain_excerpt(item.get("final_content") or item.get("draft") or "", 120)
+    card = f"""
+<div class="post-card">
+  <div class="post-card-img" style="background-image:url('{_card_image_url(item)}')"></div>
+  <div class="post-card-body">
+    <div class="post-card-title">{html_lib.escape(item.get('topic') or '')}</div>
+    <div class="post-card-text">{html_lib.escape(excerpt)}</div>
+    <div class="post-card-foot">
+      <span class="post-card-sub">{html_lib.escape(sub)}</span>
+      <span class="post-card-score">{html_lib.escape(score)}</span>
+    </div>
+  </div>
+</div>
+"""
+    with st.container(key=f"pc-{_card_key(item)}"):
+        st.markdown(card, unsafe_allow_html=True)
+        if st.button(
+            "🔎 상세 보기", key=f"open-{_card_key(item)}", use_container_width=True
+        ):
+            st.session_state["open_card"] = item
+            st.rerun()
+
+
+def _render_result_cards(items: list[dict]) -> None:
+    """결과(생성된 새 글 · 유사 글)를 카드 그리드로 표시하고, 열린 모달을 렌더."""
+    if not items:
+        return
+    st.markdown(CARD_CSS, unsafe_allow_html=True)
+    per_row = 3
+    for i in range(0, len(items), per_row):
+        cols = st.columns(per_row, gap="medium")
+        for col, item in zip(cols, items[i:i + per_row]):
+            with col:
+                _one_card(item)
+
+    if st.session_state.get("open_card") is not None:
+        _detail_dialog(st.session_state["open_card"])
 
 
 def _friendly_error(e: Exception) -> str:
@@ -332,18 +448,19 @@ def _stash_result(result: dict) -> None:
         return
 
     if result["existing"]:
+        posts = result["similar_posts"]
         st.session_state["mode"] = "existing"
-        st.session_state["similar_posts"] = result["similar_posts"]
-        st.session_state["final_content"] = result["final_content"]
-        st.session_state["seo_report"] = result["seo_report"]
+        st.session_state["cards"] = posts
+        st.session_state["grounding_src"] = posts[0] if posts else {}
         return
 
+    # 새로 생성 — 결과 dict 전체를 카드 1장으로 (모달에서 리서치/아웃라인/초안 표시)
+    item = {**result, "_kind": "new", "id": result.get("post_id")}
     st.session_state["mode"] = "new"
-    for key in ("research", "sources", "outline", "draft",
-                "final_content", "post_id", "seo_report", "image_url",
-                "search_retried", "critique_passed", "critique_feedback",
-                "was_rewritten", "research_grounded", "research_reason"):
-        st.session_state[key] = result[key]
+    st.session_state["cards"] = [item]
+    st.session_state["grounding_src"] = item
+    st.session_state["post_id"] = result.get("post_id")
+    st.session_state["tone"] = result.get("tone")
 
 
 topic = st.text_input("블로그 주제", value="대전 성심당 빵집 추천")
@@ -399,57 +516,21 @@ if mode == "aborted":
     )
     st.caption(f"입력한 주제: {topic_done}")
 
-elif mode == "existing":
-    posts = st.session_state.get("similar_posts", [])
+elif mode in ("existing", "new"):
+    cards = st.session_state.get("cards") or []
     st.divider()
-    _render_grounding_warning(posts[0] if posts else {})
-    st.warning(
-        f"이미 비슷한 글이 {len(posts)}건 있습니다. 새로 생성하지 않고 기존 글을 보여드립니다."
+    _render_grounding_warning(
+        st.session_state.get("grounding_src") or (cards[0] if cards else {})
     )
-    st.caption(f"입력한 주제: {topic_done}")
-    _render_post_cards(posts)
-    _render_seo_check()
-
-elif mode == "new":
-    st.divider()
-    _render_grounding_warning(st.session_state)
-    st.success(
-        f"새 글을 생성했습니다. (톤: {st.session_state.get('tone')} · "
-        f"blog_posts #{st.session_state.get('post_id')} 저장됨)"
-    )
-
-    hero = _card_image_url({
-        "image_url": st.session_state.get("image_url"),
-        "final_content": st.session_state.get("draft"),
-        "topic": topic_done,
-    })
-    st.image(hero, use_container_width=True)
-
-    _render_agent_log(st.session_state)
-
-    st.subheader("1. 리서치 결과")
-    st.markdown(st.session_state["research"])
-
-    sources = st.session_state.get("sources", [])
-    if sources:
-        st.markdown("**검색된 출처** (✅ = 대전 신뢰 소스)")
-        for s in sources:
-            label = s.get("title") or s.get("url")
-            if s.get("url"):
-                badge = f" ✅ {s['source_name']}" if s.get("trusted") else ""
-                st.markdown(f"- [{label}]({s['url']}){badge}")
-
-    st.subheader("2. 아웃라인")
-    st.markdown(st.session_state["outline"])
-
-    st.subheader("3. 블로그 초안")
-    st.markdown(st.session_state["draft"])
-
-    _render_seo_check()
-
-    st.download_button(
-        "📥 .md 파일로 다운로드",
-        data=st.session_state["draft"],
-        file_name=f"{blog_agent.slugify(topic_done)}.md",
-        mime="text/markdown",
-    )
+    if mode == "existing":
+        st.warning(
+            f"이미 비슷한 글이 {len(cards)}건 있습니다. "
+            "새로 생성하지 않고 기존 글을 보여드립니다."
+        )
+    else:
+        st.success(
+            f"새 글을 생성했습니다. (톤: {st.session_state.get('tone')} · "
+            f"blog_posts #{st.session_state.get('post_id')} 저장됨)"
+        )
+    st.caption(f"입력한 주제: {topic_done} · 카드를 클릭하면 상세 내용이 열립니다")
+    _render_result_cards(cards)
