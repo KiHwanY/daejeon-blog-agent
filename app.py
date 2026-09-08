@@ -278,7 +278,9 @@ _STAGE_LABELS = {
 }
 
 
-def _run_pipeline(topic_text: str, tone: str, seo_raw: str) -> dict:
+def _run_pipeline(
+    topic_text: str, tone: str, seo_raw: str, abort_on_weak_research: bool = False
+) -> dict:
     """blog_agent.generate_blog 를 단계별 st.status UI 콜백과 함께 호출한다."""
     widgets: dict = {}
 
@@ -314,6 +316,7 @@ def _run_pipeline(topic_text: str, tone: str, seo_raw: str) -> dict:
         on_stage=on_stage,
         tone=tone,
         seo_keywords=seo_raw,
+        abort_on_weak_research=abort_on_weak_research,
     )
 
 
@@ -350,6 +353,16 @@ with col2:
         "SEO 키워드 (선택 · 쉼표로 구분)", value="", placeholder="예: 대전 맛집, 성심당"
     )
 
+abort_weak = st.checkbox(
+    "리서치 근거 부족 시 생성 중단",
+    value=False,
+    help=(
+        "체크 시(옵션 A): 온라인에서 확인 가능한 구체 정보가 부족하다고 판단되면 "
+        "초안을 만들지 않고 중단합니다. 해제 시(옵션 B, 기본): 경고와 함께 "
+        "일반론 위주로 초안을 생성합니다."
+    ),
+)
+
 run = st.button("블로그 생성", type="primary")
 
 if run and topic.strip():
@@ -366,7 +379,7 @@ if run and topic.strip():
     st.session_state["seo_keywords"] = seo_raw
 
     with _guard():
-        result = _run_pipeline(t, tone, seo_raw)
+        result = _run_pipeline(t, tone, seo_raw, abort_on_weak_research=abort_weak)
         _stash_result(result)
 
 
