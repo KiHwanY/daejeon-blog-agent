@@ -78,3 +78,87 @@ class TestCritiqueDraft:
         assert CONTEXT in user_msg
         assert "전문적" in user_msg
         assert "성심당" in user_msg and "대전 빵집" in user_msg
+
+
+class TestRewriteDraftFallback:
+    def test_returns_previous_draft_when_reply_empty(self, monkeypatch):
+        _use(monkeypatch, "")  # 텍스트 블록이 비어 있는 응답
+        out = b.rewrite_draft(
+            "붕어빵 골목", "## 아웃라인", "리서치", "이전 초안 본문",
+            "피드백", tone="전문적", seo_keywords="암호화폐",
+        )
+        assert out == "이전 초안 본문"
+
+    def test_uses_rewritten_text_when_present(self, monkeypatch):
+        _use(monkeypatch, "새로 쓴 본문")
+        out = b.rewrite_draft(
+            "붕어빵 골목", "## 아웃라인", "리서치", "이전 초안 본문", "피드백",
+        )
+        assert out == "새로 쓴 본문"
+
+
+class TestCheckContrastRepetition:
+    KW = "암호화폐, 부동산 경매"
+
+    def _repetitive_text(self):
+        return (
+            "붕어빵 골목은 겨울마다 붐빈다.\n"
+            "암호화폐와 달리 붕어빵은 손에 잡히는 따뜻함을 준다.\n"
+            "부동산 경매와는 무관하게 이 골목의 가격은 몇 년째 그대로다.\n"
+            "요즘 뜨는 암호화폐와 다른 결의 재미가 여기 있다.\n"
+            "결국 부동산 경매와 대비되는 소박함이 이 골목의 매력이다."
+        )
+
+    def test_flags_when_pattern_repeats(self):
+        out = b.check_contrast_repetition(self._repetitive_text(), self.KW)
+        assert out["count"] == 4
+        assert out["repetitive"] is True
+        assert len(out["examples"]) == 3  # 예시는 최대 3개
+
+    def test_not_flagged_below_threshold(self):
+        text = (
+            "붕어빵 골목 이야기.\n"
+            "암호화폐와 달리 붕어빵은 정겹다.\n"
+            "부동산 경매와는 무관하게 골목은 늘 붐빈다."
+        )
+        out = b.check_contrast_repetition(text, self.KW)
+        assert out["count"] == 2
+        assert out["repetitive"] is False
+
+    def test_contrast_without_keyword_not_counted(self):
+        text = (
+            "작년과 달리 올해는 눈이 많다.\n"
+            "예년과는 무관하게 상인분들은 일찍 문을 연다.\n"
+            "지난겨울과 다른 결의 분위기다."
+        )
+        out = b.check_contrast_repetition(text, self.KW)
+        assert out["count"] == 0
+        assert out["repetitive"] is False
+
+    def test_keyword_without_contrast_not_counted(self):
+        text = (
+            "암호화폐 시세가 출렁인다.\n"
+            "부동산 경매 절차는 복잡하다.\n"
+            "암호화폐 투자자도 붕어빵은 좋아한다."
+        )
+        out = b.check_contrast_repetition(text, self.KW)
+        assert out["count"] == 0
+
+    def test_no_keywords_returns_zero(self):
+        out = b.check_contrast_repetition("암호화폐와 달리 붕어빵은 정겹다.", "")
+        assert out == {"count": 0, "repetitive": False, "examples": []}
+
+    def test_threshold_is_configurable(self):
+        out = b.check_contrast_repetition(self._repetitive_text(), self.KW, threshold=5)
+        assert out["count"] == 4
+        assert out["repetitive"] is False
+
+    def test_handles_none_text(self):
+        out = b.check_contrast_repetition(None, self.KW)
+        assert out["count"] == 0 and out["repetitive"] is False
+
+    def test_list_keywords_accepted(self):
+        out = b.check_contrast_repetition(
+            self._repetitive_text(), ["암호화폐", "부동산 경매"]
+        )
+        assert out["repetitive"] is True

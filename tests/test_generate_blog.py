@@ -109,6 +109,34 @@ class TestNewArticlePath:
         assert "SEO" in r["critique_feedback"]
         assert r["was_rewritten"] is True
 
+    def test_repetition_warning_appended_when_rewrite_still_repetitive(self, monkeypatch):
+        _stub_pipeline(monkeypatch, critique_pass=False)
+        repetitive = (
+            "암호화폐와 달리 붕어빵은 정겹다.\n"
+            "부동산 경매와는 무관하게 골목은 늘 붐빈다.\n"
+            "요즘 뜨는 암호화폐와 다른 결의 재미가 여기 있다."
+        )
+        monkeypatch.setattr(b, "rewrite_draft", lambda *a, **k: repetitive)
+        events = []
+        r = b.generate_blog(
+            "붕어빵 골목", on_stage=events.append, seo_keywords="암호화폐, 부동산 경매",
+        )
+        rw_done = next(
+            e for e in events if e["stage"] == "rewrite" and e["state"] == "done"
+        )
+        assert rw_done["repetition_count"] == 3
+        assert rw_done["repetition_warning"] is True
+        # critique_feedback 에 경고가 append 되어 DB/결과에 남는다 (2차 재작성은 없음)
+        assert "⚠️[자동 점검]" in r["critique_feedback"]
+        assert "3회" in r["critique_feedback"]
+        assert r["draft"] == repetitive  # 기록만, 재작성 반복 없음
+
+    def test_no_repetition_warning_when_rewrite_is_clean(self, monkeypatch):
+        _stub_pipeline(monkeypatch, critique_pass=False)
+        monkeypatch.setattr(b, "rewrite_draft", lambda *a, **k: "# 깔끔한 재작성 본문")
+        r = b.generate_blog("붕어빵 골목", seo_keywords="암호화폐, 부동산 경매")
+        assert "⚠️[자동 점검]" not in (r["critique_feedback"] or "")
+
     def test_on_search_forwarded(self, monkeypatch):
         _stub_pipeline(monkeypatch)
         seen = []
