@@ -36,6 +36,23 @@ class TestLocalizeQuery:
         assert b.localize_query("맛집 투어", region="부산") == "부산 맛집 투어"
 
 
+class TestKeywordListFromDb:
+    """지역 키워드/지역명 목록이 DB(keyword_lists)에서 온다."""
+
+    def test_seeded_lists_drive_the_checks(self):
+        # conftest 의 autouse 스텁이 db.KEYWORD_LIST_SEEDS 를 주입한 상태
+        assert set(b._keyword_list("local_keywords"))  # 비어 있지 않음
+        assert "축제" in b._keyword_list("local_keywords")
+        assert "대전" in b._keyword_list("region_names")
+
+    def test_degrades_gracefully_when_list_empty(self, monkeypatch):
+        # DB 미가동 등으로 목록이 비면 지역화 기능은 조용히 꺼진다
+        monkeypatch.setattr(b, "_keyword_list", lambda name: ())
+        assert b.needs_local_context("가을 축제 일정") is False
+        assert b.has_region_name("대전 성심당") is False
+        assert b.localize_query("가을 축제 일정") == "가을 축제 일정"  # 변경 없음
+
+
 class TestParseKeywords:
     def test_comma_string(self):
         assert b.parse_keywords("성심당, 대전 맛집 ,, 빵집") == ["성심당", "대전 맛집", "빵집"]
