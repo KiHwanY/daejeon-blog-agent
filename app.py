@@ -133,6 +133,7 @@ def _render_agent_log(src: dict) -> None:
     passed = src.get("critique_passed")
     rewritten = bool(src.get("was_rewritten"))
     feedback = src.get("critique_feedback") or ""
+    grounded = src.get("research_grounded")
 
     if passed is True and not rewritten:
         summary = "✅ 자체 검토 통과"
@@ -143,7 +144,9 @@ def _render_agent_log(src: dict) -> None:
     else:
         summary = "자체 판단 로그"
 
-    grounded = src.get("research_grounded")
+    # 리서치 근거 부족은 검토 결과보다 우선해서 제목에 노출
+    if grounded is False:
+        summary = f"⚠️ 리서치 근거 부족 · {summary}"
 
     with st.expander(f"🧠 에이전트 판단 로그 — {summary}"):
         if grounded is not None:
