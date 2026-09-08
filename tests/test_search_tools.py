@@ -304,3 +304,64 @@ def test_no_synthesis_call_when_no_sources(monkeypatch):
     res = stt.run_search_loop(client, "q", "sys", max_turns=2)
     assert res["text"] == ""
     assert len(client.messages.calls) == 2
+
+
+# --------------------------------------------------------------------------
+# run_search_loop — 근거 충분성 판정 (assess_grounding)
+# --------------------------------------------------------------------------
+def _grounding_script(payload_text):
+    return _tool_then_stop() + [_Resp([_Block(type="text", text=payload_text)])]
+
+
+def test_assess_grounding_grounded_true(monkeypatch):
+    monkeypatch.setattr(stt, "web_search", lambda q, **k: [_hit("https://a/1")])
+    client = _FakeClient(_grounding_script(
+        '{"grounded": true, "reason": "개점일·주소·수치가 확인됨"}'
+    ))
+    events = []
+    res = stt.run_search_loop(
+        client, "q", "sys", on_stage=events.append, assess_grounding=True,
+    )
+    assert res["research_grounded"] is True
+    assert res["research_reason"] == "개점일·주소·수치가 확인됨"
+    assert [(e["stage"], e["state"]) for e in events] == [
+        ("grounding", "start"), ("grounding", "done"),
+    ]
+    assert events[-1]["grounded"] is True
+
+
+def test_assess_grounding_grounded_false(monkeypatch):
+    monkeypatch.setattr(stt, "web_search", lambda q, **k: [_hit("https://a/1")])
+    client = _FakeClient(_grounding_script(
+        '```json\n{"grounded": false, "reason": "일반론뿐 구체 정보 없음"}\n```'
+    ))
+    res = stt.run_search_loop(client, "q", "sys", assess_grounding=True)
+    assert res["research_grounded"] is False
+    assert res["research_reason"] == "일반론뿐 구체 정보 없음"
+
+
+def test_assess_grounding_fails_open_on_bad_json(monkeypatch):
+    monkeypatch.setattr(stt, "web_search", lambda q, **k: [_hit("https://a/1")])
+    client = _FakeClient(_grounding_script("모르겠습니다"))
+    res = stt.run_search_loop(client, "q", "sys", assess_grounding=True)
+    assert res["research_grounded"] is True  # 판정 실패 시 경고를 띄우지 않는 쪽
+    assert "해석" in res["research_reason"]
+
+
+def test_assess_grounding_fails_open_on_api_error(monkeypatch):
+    monkeypatch.setattr(stt, "web_search", lambda q, **k: [_hit("https://a/1")])
+    # 스크립트를 2개만 줘서 판정용 3번째 create 호출이 예외를 던지게 한다
+    client = _FakeClient(_tool_then_stop())
+    res = stt.run_search_loop(client, "q", "sys", assess_grounding=True)
+    assert res["research_grounded"] is True
+    assert "실패" in res["research_reason"]
+
+
+def test_no_grounding_call_by_default(monkeypatch):
+    monkeypatch.setattr(stt, "web_search", lambda q, **k: [_hit("https://a/1")])
+    client = _FakeClient(_tool_then_stop())
+    events = []
+    res = stt.run_search_loop(client, "q", "sys", on_stage=events.append)
+    assert res["research_grounded"] is True and res["research_reason"] == ""
+    assert len(client.messages.calls) == 2          # 판정 호출 없음
+    assert events == []                             # grounding 이벤트 없음
