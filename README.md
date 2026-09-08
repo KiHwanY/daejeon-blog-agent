@@ -54,7 +54,7 @@ daejeon-blog-agent/
 ├── .gitignore
 ├── .github/
 │   └── workflows/ci.yml    # push(main)/PR 시 ruff + pytest 실행
-├── tests/                  # 단위 테스트 (LLM·DB·네트워크 모두 모의, 98개)
+├── tests/                  # 단위 테스트 (LLM·DB·네트워크 모두 모의, 100개)
 │   ├── conftest.py         # src/ 를 import 경로에 추가
 │   ├── test_text_utils.py  # 지역화·SEO 키워드·slug 등 순수 함수
 │   ├── test_search_tools.py # 신뢰 소스 판별·검색 루프·재시도·근거 판정·JSON 추출
@@ -79,10 +79,12 @@ DB 스키마(`src/db.py`가 생성):
 | `trusted_sources` | 신뢰 도메인 목록 (대전 소스 4개 시드) | `domain` (UNIQUE), `name`, `category` |
 | `blog_posts` | 생성된 블로그 글 + 임베딩 + 메타 | `topic`, `outline`, `draft`, `final_content`, `tone`, `seo_keywords`, `image_url`, `critique_passed`, `critique_feedback`, `was_rewritten`, `search_retried`, `research_grounded`, `research_reason`, `embedding vector(768)` |
 | `search_cache` | 웹 검색 결과 캐시 (검색어 임베딩으로 재사용) | `query`, `results_json`, `embedding vector(768)`, `created_at` |
+| `keyword_lists` | 코드에 있던 참조용 문자열 목록(지역 키워드·지역명·대비 표현)을 DB로 이관 | `list_name`, `value` (PK: `list_name`+`value`) — `local_keywords` / `region_names` / `contrast_markers` 3종 시드 |
 
 - `blog_posts.embedding` · `search_cache.embedding` 에는 코사인 거리(`<=>`) 최근접 검색용 **HNSW 인덱스**가 생성되어, 글이 늘어나도 유사도 조회가 순차 스캔으로 느려지지 않습니다.
 - `search_cache.created_at` 에는 TTL 필터용 B-tree 인덱스가 있습니다.
 - `blog_posts` 의 확장 컬럼(`image_url` · 자체 검토 메타 · 근거 판정 메타)은 `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` 로 추가되어, 기존 DB에서 `python src/db.py` 를 다시 실행해도 안전합니다.
+- `keyword_lists` 는 `needs_local_context` / `has_region_name` / `check_contrast_repetition` 가 멤버십 체크에만 쓰던 문자열 목록을 옮긴 것입니다. `blog_agent._keyword_list()` 가 프로세스당 1회만 조회해 캐시하고, DB가 없거나 목록이 비면 해당 기능(지역화·반복 감지)을 조용히 끕니다(하드 실패 없음).
 
 ## 설치 방법
 
@@ -161,8 +163,9 @@ PEXELS_API_KEY=
 python src/db.py
 ```
 
-`vector` 확장 생성 → `trusted_sources` / `blog_posts` / `search_cache` 테이블·확장 컬럼 생성 → HNSW 인덱스 생성 →
-대전 기본 도메인 4개 시딩 → 생성 결과 검증 출력까지 수행합니다. 멱등이라 여러 번 실행해도 안전합니다.
+`vector` 확장 생성 → `trusted_sources` / `blog_posts` / `search_cache` / `keyword_lists` 테이블·확장 컬럼 생성 → HNSW 인덱스 생성 →
+`trusted_sources`(대전 도메인 4개)·`keyword_lists`(지역 키워드·지역명·대비 표현) 시딩 →
+생성 결과 검증 출력까지 수행합니다. 멱등이라 여러 번 실행해도 안전합니다.
 
 ### 7. (선택) 기존 글 이미지 백필
 
@@ -247,8 +250,8 @@ ruff check .    # 린트 + import 정렬 (E/F/I, 한국어 폭 때문에 E501 �
 pytest          # 단위 테스트
 ```
 
-- `tests/` 에 **98개** 케이스(5개 파일)가 있으며, **Claude API·DuckDuckGo·Pexels·PostgreSQL 호출을 전부 모의(mock)** 처리합니다. API 키나 실행 중인 DB 없이 `pytest`만으로 통과합니다.
-- 커버 범위: 지역화/SEO 키워드/slug 등 순수 함수(`test_text_utils`), 신뢰 도메인 판별·tool-use 루프·검색 재시도·근거 충분성 판정(fail-open 포함)·JSON 추출(`test_search_tools`), Pexels 이미지 검색의 모든 실패 경로(`test_images`), `critique_draft` JSON 파싱·반복 감지·재작성 폴백(`test_critique`), `generate_blog` 단계 순서·결과 dict·근거 부족 옵션 A/B(`test_generate_blog`).
+- `tests/` 에 **100개** 케이스(5개 파일)가 있으며, **Claude API·DuckDuckGo·Pexels·PostgreSQL 호출을 전부 모의(mock)** 처리합니다. API 키나 실행 중인 DB 없이 `pytest`만으로 통과합니다.
+- 커버 범위: 지역화(`keyword_lists` 경유·빈 목록 degrade)/SEO 키워드/slug 등 순수 함수(`test_text_utils`), 신뢰 도메인 판별·tool-use 루프·검색 재시도·근거 충분성 판정(fail-open 포함)·JSON 추출(`test_search_tools`), Pexels 이미지 검색의 모든 실패 경로(`test_images`), `critique_draft` JSON 파싱·반복 감지·재작성 폴백(`test_critique`), `generate_blog` 단계 순서·결과 dict·근거 부족 옵션 A/B(`test_generate_blog`).
 - `pyproject.toml` 에 pytest(`pythonpath=["src"]`)·ruff 설정이 있고, `.github/workflows/ci.yml` 이 `main` push와 모든 PR에서 위 두 명령을 실행합니다.
 
 ## 주의사항

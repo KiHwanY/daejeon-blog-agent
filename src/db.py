@@ -96,6 +96,16 @@ SCHEMA_STATEMENTS = [
     CREATE INDEX IF NOT EXISTS search_cache_created_at
         ON search_cache (created_at DESC);
     """,
+    # 코드에 하드코딩돼 있던 참조용 문자열 목록(지역 키워드·지역명·대비 표현 등).
+    # list_name 으로 묶어 (list_name, value) 로 저장한다.
+    """
+    CREATE TABLE IF NOT EXISTS keyword_lists (
+        list_name  TEXT NOT NULL,
+        value      TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT now(),
+        PRIMARY KEY (list_name, value)
+    );
+    """,
 ]
 
 # trusted_sources 기본 시드 (대전 관련 도메인)
@@ -105,6 +115,34 @@ TRUSTED_SOURCE_SEEDS = [
     ("daejonilbo.com", "대전일보", "지역언론"),
     ("joongdo.co.kr", "중도일보", "지역언론"),
 ]
+
+# keyword_lists 기본 시드 (blog_agent 가 멤버십 체크에만 쓰는 참조 문자열 목록)
+KEYWORD_LIST_SEEDS = {
+    # 지역 정보가 필요한 주제/검색어인지 판단하는 키워드
+    "local_keywords": (
+        "축제", "행사", "공연", "전시", "맛집", "카페", "베이커리", "브런치", "날씨",
+        "여행", "관광", "명소", "가볼만한", "주말", "나들이", "데이트", "코스", "근교",
+        "등산", "산책", "공원", "시장", "재래시장", "불꽃", "벚꽃", "단풍", "야경",
+        "핫플", "병원", "부동산", "아파트", "전세", "월세", "분양", "교통", "지하철",
+        "버스", "학원", "도서관", "캠핑", "숙소", "호텔", "펜션", "지역", "동네",
+    ),
+    # 이미 특정 지역명이 들어 있으면 '대전'을 자동으로 덧붙이지 않는다
+    "region_names": (
+        "서울", "부산", "대구", "인천", "광주", "대전", "울산", "세종",
+        "경기", "강원", "충북", "충남", "전북", "전남", "경북", "경남", "제주",
+        "수원", "성남", "용인", "고양", "천안", "청주", "전주", "포항", "창원", "김해",
+        "구미", "아산", "당진", "논산", "공주", "세종시",
+    ),
+    # 재작성본에서 'SEO 키워드를 본문과 대비/구별짓는' 상투적 구문
+    "contrast_markers": (
+        "와 달리", "과 달리", "와는 달리", "과는 달리",
+        "와 무관하게", "과 무관하게", "와는 무관하게", "과는 무관하게",
+        "와 무관한", "과 무관한",
+        "와 다른 결", "과 다른 결",
+        "와 대비", "과 대비", "와 대조", "과 대조",
+        "와는 다른", "과는 다른",
+    ),
+}
 
 
 def init_db() -> None:
@@ -123,6 +161,20 @@ def init_db() -> None:
                     ON CONFLICT (domain) DO NOTHING;
                     """,
                     TRUSTED_SOURCE_SEEDS,
+                )
+
+                keyword_rows = [
+                    (list_name, value)
+                    for list_name, values in KEYWORD_LIST_SEEDS.items()
+                    for value in values
+                ]
+                cur.executemany(
+                    """
+                    INSERT INTO keyword_lists (list_name, value)
+                    VALUES (%s, %s)
+                    ON CONFLICT (list_name, value) DO NOTHING;
+                    """,
+                    keyword_rows,
                 )
     finally:
         conn.close()
@@ -265,6 +317,30 @@ def get_trusted_sources() -> list[dict]:
     return [{"domain": r[0], "name": r[1], "category": r[2]} for r in rows]
 
 
+def get_keyword_list(list_name: str) -> list[str]:
+    """keyword_lists 에서 주어진 list_name 의 값들을 반환한다.
+
+    DB 접속/조회에 실패하면 빈 리스트를 반환한다(호출부가 빈 목록으로 degrade).
+    """
+    try:
+        conn = get_connection()
+    except Exception:  # noqa: BLE001 - DB 미가동 시 해당 기능 없이 진행
+        return []
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT value FROM keyword_lists WHERE list_name = %s;",
+                (list_name,),
+            )
+            rows = cur.fetchall()
+    except Exception:  # noqa: BLE001
+        return []
+    finally:
+        conn.close()
+
+    return [r[0] for r in rows]
+
+
 def find_cached_search(
     query: str,
     threshold: float = SEARCH_CACHE_SIMILARITY,
@@ -346,7 +422,8 @@ def _verify() -> None:
                 SELECT table_name
                 FROM information_schema.tables
                 WHERE table_schema = 'public'
-                  AND table_name IN ('trusted_sources', 'blog_posts', 'search_cache')
+                  AND table_name IN ('trusted_sources', 'blog_posts',
+                                     'search_cache', 'keyword_lists')
                 ORDER BY table_name;
                 """
             )
@@ -361,6 +438,12 @@ def _verify() -> None:
             )
             for row in cur.fetchall():
                 print("  ", row)
+
+            cur.execute(
+                "SELECT list_name, count(*) FROM keyword_lists "
+                "GROUP BY list_name ORDER BY list_name;"
+            )
+            print("keyword_lists:", dict(cur.fetchall()))
 
             cur.execute(
                 """

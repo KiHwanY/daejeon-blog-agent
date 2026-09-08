@@ -14,12 +14,13 @@ Streamlit 프론트엔드:
 
 import os
 import re
+from functools import lru_cache
 
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
 from config import DEFAULT_REGION, MODEL, SIMILARITY_THRESHOLD
-from db import find_similar_posts, save_blog_post
+from db import find_similar_posts, get_keyword_list, save_blog_post
 from embeddings import embed_text
 from images import get_topic_image
 from search_tools import extract_json, last_text, run_search_loop
@@ -65,32 +66,25 @@ _LOW_GROUNDING_INSTRUCTION = (
     "불확실한 부분은 '~로 알려져 있습니다', '방문 전 확인이 필요합니다'처럼 완곡하게 표현하세요."
 )
 
-# 지역 맥락이 필요한 주제인지 판단하는 키워드
-_LOCAL_KEYWORDS = (
-    "축제", "행사", "공연", "전시", "맛집", "카페", "베이커리", "브런치", "날씨",
-    "여행", "관광", "명소", "가볼만한", "주말", "나들이", "데이트", "코스", "근교",
-    "등산", "산책", "공원", "시장", "재래시장", "불꽃", "벚꽃", "단풍", "야경",
-    "핫플", "병원", "부동산", "아파트", "전세", "월세", "분양", "교통", "지하철",
-    "버스", "학원", "도서관", "캠핑", "숙소", "호텔", "펜션", "지역", "동네",
-)
 
-# 이미 특정 지역명이 들어 있으면 '대전'을 자동으로 덧붙이지 않는다
-_REGION_NAMES = (
-    "서울", "부산", "대구", "인천", "광주", "대전", "울산", "세종",
-    "경기", "강원", "충북", "충남", "전북", "전남", "경북", "경남", "제주",
-    "수원", "성남", "용인", "고양", "천안", "청주", "전주", "포항", "창원", "김해",
-    "구미", "아산", "당진", "논산", "공주", "세종시",
-)
+@lru_cache(maxsize=None)
+def _keyword_list(list_name: str) -> tuple[str, ...]:
+    """keyword_lists 테이블의 목록을 프로세스 1회만 조회해 캐시한다.
+
+    DB가 없거나 비어 있으면 빈 튜플 → 해당 기능은 조용히 비활성(하드 실패 금지).
+    (list_name: "local_keywords" | "region_names" | "contrast_markers")
+    """
+    return tuple(get_keyword_list(list_name))
 
 
 def needs_local_context(text: str) -> bool:
     """지역 정보가 필요한 주제/검색어인지 여부"""
-    return any(kw in text for kw in _LOCAL_KEYWORDS)
+    return any(kw in text for kw in _keyword_list("local_keywords"))
 
 
 def has_region_name(text: str) -> bool:
     """문자열에 이미 특정 지역명이 포함되어 있는지 여부"""
-    return any(name in text for name in _REGION_NAMES)
+    return any(name in text for name in _keyword_list("region_names"))
 
 
 def localize_query(query: str, region: str = DEFAULT_REGION) -> str:
@@ -339,17 +333,6 @@ def rewrite_draft(
     return last_text(response) or previous_draft
 
 
-# 재작성본에서 'SEO 키워드를 본문과 대비/구별짓는' 상투적 구문
-_CONTRAST_MARKERS = (
-    "와 달리", "과 달리", "와는 달리", "과는 달리",
-    "와 무관하게", "과 무관하게", "와는 무관하게", "과는 무관하게",
-    "와 무관한", "과 무관한",
-    "와 다른 결", "과 다른 결",
-    "와 대비", "과 대비", "와 대조", "과 대조",
-    "와는 다른", "과는 다른",
-)
-
-
 def _split_sentences(text: str) -> list[str]:
     """마침표·물음표·느낌표·줄바꿈 기준으로 대략적인 문장 리스트를 만든다."""
     return [s.strip() for s in re.split(r"[.!?\n]+", text or "") if s.strip()]
@@ -358,8 +341,8 @@ def _split_sentences(text: str) -> list[str]:
 def check_contrast_repetition(text: str, seo_keywords, threshold: int = 3) -> dict:
     """규칙 기반(무 LLM) 반복 패턴 점검.
 
-    '대비 표현'(_CONTRAST_MARKERS)과 SEO 키워드가 같은 문장에 함께 등장하는
-    빈도를 센다. threshold 회 이상이면 repetitive=True.
+    '대비 표현'(keyword_lists 의 contrast_markers)과 SEO 키워드가 같은 문장에
+    함께 등장하는 빈도를 센다. threshold 회 이상이면 repetitive=True.
 
     반환: {"count": int, "repetitive": bool, "examples": list[str]}
     """
@@ -367,9 +350,10 @@ def check_contrast_repetition(text: str, seo_keywords, threshold: int = 3) -> di
     if not keywords:
         return {"count": 0, "repetitive": False, "examples": []}
 
+    markers = _keyword_list("contrast_markers")
     hits = []
     for sentence in _split_sentences(text):
-        has_contrast = any(marker in sentence for marker in _CONTRAST_MARKERS)
+        has_contrast = any(marker in sentence for marker in markers)
         has_keyword = any(kw in sentence for kw in keywords)
         if has_contrast and has_keyword:
             hits.append(sentence)
